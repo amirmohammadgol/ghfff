@@ -16,6 +16,8 @@ XRAY_INBOUND_PORT=int(os.environ.get('XRAY_INBOUND_PORT','10000'))
 XRAY_API_ADDR=os.environ.get('XRAY_API_ADDR','127.0.0.1:10085')
 SESSIONS={}
 XRAY_PROC=None
+SESSION_USERS={}
+
 XRAY_LOCK=threading.RLock()
 
 
@@ -29,6 +31,10 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, uuid TEXT NOT NULL UNIQUE,
       sub_id TEXT NOT NULL UNIQUE, gb REAL NOT NULL, days INTEGER NOT NULL,
       created_at INTEGER NOT NULL, expiry_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS panel_users(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
+      enabled INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS traffic(
       client_id INTEGER PRIMARY KEY, upload INTEGER NOT NULL DEFAULT 0,
@@ -37,10 +43,39 @@ def init_db():
     for col in ('raw_upload','raw_download'):
         try: c.execute(f'ALTER TABLE traffic ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
+    for col,typ,default in [('protocol','TEXT',"'vless'"),('dns_server','TEXT',"'1.1.1.1'"),('wg_private_key','TEXT',"''"),('wg_address','TEXT',"''")]:
+        try: c.execute(f'ALTER TABLE clients ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}')
+        except sqlite3.OperationalError: pass
+    # Seed the first administrator from environment variables, only on first startup.
+    if c.execute('SELECT COUNT(*) FROM panel_users').fetchone()[0] == 0:
+        import hashlib
+        ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
+        c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
     defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'sub_path':SUB_PATH,
-              'panel_title':'vpnstan','support_url':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
+              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
+
+def hash_password(v):
+    import hashlib
+    return hashlib.sha256(str(v).encode()).hexdigest()
+
+def current_user(h):
+    for x in h.headers.get('Cookie','').split(';'):
+        if x.strip().startswith('vpnstan_session='):
+            t=x.strip().split('=',1)[1]
+            if SESSIONS.get(t,0)>time.time():
+                uid=SESSION_USERS.get(t)
+                if uid:
+                    c=db(); r=c.execute('SELECT id,username,role,enabled FROM panel_users WHERE id=?',(uid,)).fetchone(); c.close()
+                    if r and r['enabled']: return r
+    return None
+
+def is_admin(h):
+    u=current_user(h); return bool(u and u['role']=='admin')
+
+def auth_error(h):
+    return send(h,401,{'success':False,'msg':'نیاز به ورود دارید'})
 
 def settings():
     c=db(); rows=c.execute('SELECT k,v FROM settings').fetchall(); c.close(); return {r['k']:r['v'] for r in rows}
@@ -109,23 +144,18 @@ def collect_xray_stats():
     c.commit(); c.close()
 
 def write_xray_config():
+    os.makedirs(os.path.dirname(XRAY_CONFIG),exist_ok=True)
     s=settings(); path=s.get('ws_path','/ws') or '/ws'
-    clients=[{'id':r['uuid'],'email':r['name'],'level':0} for r in active_clients()]
-    cfg={
-      'log':{'loglevel':'warning'},
-      'api':{'tag':'api','listen':XRAY_API_ADDR,'services':['StatsService']},
-      'stats':{},
-      'policy':{'levels':{'0':{'statsUserUplink':True,'statsUserDownlink':True,'statsUserOnline':True}},
-                'system':{'statsInboundUplink':True,'statsInboundDownlink':True}},
-      'inbounds':[{'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
-        'settings':{'clients':clients,'decryption':'none'},
-        'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':path}}}],
-      'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]
-    }
+    vclients=[{'id':r['uuid'],'email':r['name'],'level':0} for r in active_clients() if (r['protocol'] or 'vless')=='vless']
+    inbounds=[{'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
+        'settings':{'clients':vclients,'decryption':'none'},
+        'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':path}}}]
+    cfg={'log':{'loglevel':'warning'},'api':{'tag':'api','listen':XRAY_API_ADDR,'services':['StatsService']},'stats':{},
+      'policy':{'levels':{'0':{'statsUserUplink':True,'statsUserDownlink':True,'statsUserOnline':True}},'system':{'statsInboundUplink':True,'statsInboundDownlink':True}},
+      'inbounds':inbounds,'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
     tmp=XRAY_CONFIG+'.tmp'
     with open(tmp,'w',encoding='utf-8') as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
-    os.replace(tmp,XRAY_CONFIG)
-    return cfg
+    os.replace(tmp,XRAY_CONFIG); return cfg
 
 def restart_xray():
     global XRAY_PROC
@@ -167,11 +197,7 @@ def collector_loop():
         time.sleep(15)
 
 def authed(h):
-    for x in h.headers.get('Cookie','').split(';'):
-        if x.strip().startswith('vpnstan_session='):
-            t=x.strip().split('=',1)[1]
-            if SESSIONS.get(t,0)>time.time(): return True
-    return False
+    return current_user(h) is not None
 
 def body(h):
     n=int(h.headers.get('Content-Length','0')); return json.loads(h.rfile.read(n) or b'{}')
@@ -187,18 +213,30 @@ def host_for(h,s):
 
 
 def link_for(h,r,s):
-    host=host_for(h,s); port=int(s.get('node_port','443')); path=s.get('ws_path','/ws') or '/ws'
+    proto=(r['protocol'] if 'protocol' in r.keys() else 'vless') or 'vless'
+    host=host_for(h,s)
+    if proto=='wireguard': return wg_config_for(h,r,s)
+    if proto=='dns': return f'dns://{r["dns_server"] or s.get("dns_server","1.1.1.1")}:53#{urllib.parse.quote(r["name"])}'
+    port=int(s.get('node_port','443')); path=s.get('ws_path','/ws') or '/ws'
     qp=urllib.parse.urlencode({'encryption':'none','security':'tls','type':'ws','host':host,'path':path,'sni':host},safe='/')
     return f'vless://{r["uuid"]}@{host}:{port}?{qp}#{urllib.parse.quote(r["name"])}'
+
+def wg_config_for(h,r,s):
+    endpoint=s.get('wg_endpoint','') or 'SET-WIREGUARD-ENDPOINT:51820'
+    server_key=s.get('wg_server_public_key','') or 'SET-SERVER-PUBLIC-KEY'
+    private=r['wg_private_key'] or 'GENERATE-CLIENT-PRIVATE-KEY'
+    addr=r['wg_address'] or '10.66.0.2/32'
+    dns=r['dns_server'] or s.get('dns_server','1.1.1.1')
+    return f'[Interface]\nPrivateKey = {private}\nAddress = {addr}\nDNS = {dns}\n\n[Peer]\nPublicKey = {server_key}\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = {endpoint}\nPersistentKeepalive = 25'
 
 def client_data(h,r,s):
     now=int(time.time()); tr=traffic_for(r['id']); used=tr['upload']+tr['download']; total=int(float(r['gb'])*1024**3); remain=max(0,total-used)
     sub_host=host_for(h,s); sub=f'https://{sub_host}/{s.get("sub_path","sub").strip("/")}/{r["sub_id"]}'
     online=(tr['last_seen'] and now-tr['last_seen']<=90)
-    return {'id':r['id'],'name':r['name'],'uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
+    return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
-            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'subscription':sub}
+            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1'),'wireguardConfig':wg_config_for(h,r,s)}
 
 def load_sub(h,sid):
     s=settings(); c=db(); rows=c.execute('SELECT * FROM clients WHERE sub_id=? AND enabled=1',(sid,)).fetchall(); c.close(); now=int(time.time())
@@ -209,7 +247,7 @@ def sub_page(h,sid):
     s,rows=load_sub(h,sid)
     if not rows:
         h.send_response(404); h.send_header('Content-Type','text/html; charset=utf-8'); h.end_headers(); h.wfile.write('<h2>اشتراک پیدا نشد یا منقضی شده است.</h2>'.encode()); return
-    r=rows[0]; d=client_data(h,r,s); title=html.escape(s.get('panel_title','vpnstan')); name=html.escape(r['name']); link=html.escape(d['vless'],quote=True); sub=html.escape(d['subscription'],quote=True)
+    r=rows[0]; d=client_data(h,r,s); proto=(r['protocol'] or 'vless').upper(); title=html.escape(s.get('panel_title','vpnstan')); name=html.escape(r['name']); link=html.escape(d['vless'],quote=True); sub=html.escape(d['subscription'],quote=True)
     pct=min(100,(d['used']/d['totalBytes']*100) if d['totalBytes'] else 0); status='آنلاین' if d['online'] else 'آفلاین'
     support=html.escape(s.get('support_url',''),quote=True); announce=html.escape(s.get('announce',''))
     qr=f'/qr/{r["sub_id"]}'
@@ -217,9 +255,9 @@ def sub_page(h,sid):
 *{{box-sizing:border-box}}body{{margin:0;background:#070b14;color:#e8eefc;font-family:Tahoma,Arial,sans-serif}}.wrap{{max-width:920px;margin:auto;padding:28px 16px 50px}}.card{{background:linear-gradient(145deg,#111827,#0b1220);border:1px solid #26324a;border-radius:22px;padding:24px;box-shadow:0 18px 50px #0006;margin-bottom:16px}}.top{{display:flex;justify-content:space-between;gap:15px;align-items:center}}.brand{{font-size:22px;font-weight:800}}.muted{{color:#91a0bb;font-size:13px}}h1{{font-size:25px;margin:8px 0}}h2{{font-size:17px;margin:0 0 16px}}.badge{{padding:7px 12px;border-radius:999px;background:#17233a;color:#9db8ff;font-size:12px}}.online{{color:#58e0a0}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}.stat{{background:#0a1120;border:1px solid #202d43;border-radius:16px;padding:15px}}.stat b{{display:block;font-size:18px;margin-top:6px}}.bar{{height:10px;background:#1b2639;border-radius:99px;overflow:hidden;margin:12px 0}}.fill{{height:100%;background:linear-gradient(90deg,#5b8cff,#7b5cff);border-radius:99px}}.row{{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #202b3d;font-size:13px}}.row:last-child{{border:0}}.code{{direction:ltr;text-align:left;background:#050811;border:1px solid #202a3c;border-radius:14px;padding:13px;word-break:break-all;font-family:Consolas,monospace;font-size:12px;color:#bcd0ff}}button,a.btn{{display:inline-block;border:0;border-radius:12px;padding:11px 15px;background:#5b72ff;color:#fff;cursor:pointer;text-decoration:none;font-weight:700;margin-top:10px}}button.secondary{{background:#18243a}}.qr{{width:170px;height:170px;background:#fff;border-radius:12px;padding:8px;display:block;margin:8px auto}}.announce{{background:#0d1729;border:1px dashed #30415f;border-radius:14px;padding:12px;color:#b9c7dd;font-size:13px}}@media(max-width:700px){{.grid{{grid-template-columns:repeat(2,1fr)}}.top{{align-items:flex-start}}}}
 </style></head><body><div class="wrap"><div class="card"><div class="top"><div><div class="brand">{title}</div><div class="muted">صفحه اشتراک حرفه‌ای</div></div><div class="badge {'online' if d['online'] else ''}">● {status}</div></div><h1>{name}</h1><div class="muted">شناسه اشتراک: {html.escape(r['sub_id'])}</div></div>
 <div class="card"><h2>وضعیت مصرف</h2><div class="grid"><div class="stat"><span class="muted">حجم کل</span><b>{d['totalText']}</b></div><div class="stat"><span class="muted">مصرف‌شده</span><b>{d['usedText']}</b></div><div class="stat"><span class="muted">باقی‌مانده</span><b>{d['remainingText']}</b></div><div class="stat"><span class="muted">انقضا</span><b>{html.escape(d['expiryText'])}</b></div></div><div class="bar"><div class="fill" style="width:{pct:.1f}%"></div></div><div class="row"><span>دانلود</span><b>{d['downloadText']}</b></div><div class="row"><span>آپلود</span><b>{d['uploadText']}</b></div></div>
-<div class="card"><h2>کانفیگ VLESS</h2><div class="code" id="cfg">{link}</div><button onclick="copyText('cfg')">کپی کانفیگ</button><button class="secondary" onclick="copyText('sub')">کپی لینک اشتراک</button><div id="sub" class="code" style="margin-top:10px">{sub}</div></div>
+<div class="card"><h2>کانفیگ {proto}</h2><div class="code" id="cfg">{link}</div><button onclick="copyText('cfg')">کپی کانفیگ</button><button class="secondary" onclick="copyText('sub')">کپی لینک اشتراک</button><div id="sub" class="code" style="margin-top:10px">{sub}</div></div>
 <div class="card"><h2>QR کانفیگ</h2><img class="qr" src="{qr}" alt="QR"><div class="muted" style="text-align:center">اسکن برای دریافت لینک کانفیگ</div></div>
-<div class="card"><h2>جزئیات اتصال</h2><div class="row"><span>پروتکل</span><b>VLESS</b></div><div class="row"><span>Transport</span><b>WebSocket + TLS</b></div><div class="row"><span>مسیر</span><b>{html.escape(s.get('ws_path','/ws'))}</b></div><div class="row"><span>آخرین فعالیت</span><b>{fmt_date(d['lastSeen']) if d['lastSeen'] else 'هنوز ثبت نشده'}</b></div></div>
+<div class="card"><h2>جزئیات اتصال</h2><div class="row"><span>پروتکل</span><b>{proto}</b></div><div class="row"><span>Transport</span><b>{('WebSocket + TLS' if proto=='VLESS' else ('WireGuard' if proto=='WIREGUARD' else 'DNS Resolver'))}</b></div><div class="row"><span>مسیر</span><b>{html.escape(s.get('ws_path','/ws'))}</b></div><div class="row"><span>آخرین فعالیت</span><b>{fmt_date(d['lastSeen']) if d['lastSeen'] else 'هنوز ثبت نشده'}</b></div></div>
 <div class="announce">{announce}</div>{('<a class="btn" href="'+support+'">پشتیبانی</a>') if support else ''}</div><script>function copyText(id){{navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(()=>alert('کپی شد'))}}</script></body></html>'''
     raw=page.encode(); h.send_response(200); h.send_header('Content-Type','text/html; charset=utf-8'); h.send_header('Cache-Control','no-store'); h.send_header('Content-Length',str(len(raw))); h.end_headers(); h.wfile.write(raw)
 
@@ -258,7 +296,12 @@ class H(BaseHTTPRequestHandler):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]
             for r in rows: out.append({'protocol':'vless','tag':r['name'],'settings':{'vnext':[{'address':host_for(self,s),'port':int(s.get('node_port','443')),'users':[{'id':r['uuid'],'encryption':'none'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host_for(self,s)},'wsSettings':{'path':s.get('ws_path','/ws')}}})
             return send(self,200,out)
-        if p=='/api/me': return send(self,200,{'authenticated':authed(self)})
+        if p=='/api/me':
+            u=current_user(self); return send(self,200,{'authenticated':bool(u),'user':({'id':u['id'],'username':u['username'],'role':u['role']} if u else None)})
+        if p=='/api/admin/users':
+            if not is_admin(self): return send(self,403,{'success':False,'msg':'فقط ادمین دسترسی دارد'})
+            c=db(); rows=c.execute('SELECT id,username,role,enabled,created_at FROM panel_users ORDER BY id').fetchall(); c.close()
+            return send(self,200,{'success':True,'users':[dict(r) for r in rows]})
         if p=='/api/settings':
             if not authed(self): return send(self,401,{'success':False,'msg':'نیاز به ورود دارید'})
             return send(self,200,{'success':True,'settings':settings()})
@@ -284,16 +327,46 @@ class H(BaseHTTPRequestHandler):
         if p=='/api/login':
             try:d=body(self)
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
-            if hmac.compare_digest(str(d.get('username','')),USERNAME) and hmac.compare_digest(str(d.get('password','')),PASSWORD):
-                t=secrets.token_urlsafe(32); SESSIONS[t]=time.time()+86400; return send(self,200,{'success':True},{'Set-Cookie':f'vpnstan_session={t}; Path=/; HttpOnly; SameSite=Lax'})
+            c=db(); r=c.execute('SELECT * FROM panel_users WHERE username=? AND enabled=1',(str(d.get('username','')).strip(),)).fetchone(); c.close()
+            if r and hmac.compare_digest(r['password_hash'],hash_password(d.get('password',''))):
+                t=secrets.token_urlsafe(32); SESSIONS[t]=time.time()+86400; SESSION_USERS[t]=r['id']; return send(self,200,{'success':True,'user':{'username':r['username'],'role':r['role']}},{'Set-Cookie':f'vpnstan_session={t}; Path=/; HttpOnly; SameSite=Lax'})
             return send(self,401,{'success':False,'msg':'نام کاربری یا رمز عبور اشتباه است'})
         if p=='/api/logout':
             for x in self.headers.get('Cookie','').split(';'):
-                if x.strip().startswith('vpnstan_session='): SESSIONS.pop(x.strip().split('=',1)[1],None)
+                if x.strip().startswith('vpnstan_session='): SESSIONS.pop(x.strip().split('=',1)[1],None); SESSION_USERS.pop(x.strip().split('=',1)[1],None)
             return send(self,200,{'success':True},{'Set-Cookie':'vpnstan_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax'})
         if not authed(self): return send(self,401,{'success':False,'msg':'نیاز به ورود دارید'})
+        if p=='/api/account/change':
+            try:d=body(self); u=current_user(self); old=str(d.get('oldPassword','')); nu=str(d.get('username','')).strip(); np=str(d.get('newPassword',''))
+            except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
+            c=db(); row=c.execute('SELECT * FROM panel_users WHERE id=?',(u['id'],)).fetchone()
+            if not row or not hmac.compare_digest(row['password_hash'],hash_password(old)): c.close(); return send(self,400,{'success':False,'msg':'رمز فعلی اشتباه است'})
+            if len(nu)<3 or len(np)<4: c.close(); return send(self,400,{'success':False,'msg':'نام کاربری حداقل ۳ و رمز حداقل ۴ کاراکتر باشد'})
+            try:
+                c.execute('UPDATE panel_users SET username=?,password_hash=? WHERE id=?',(nu,hash_password(np),u['id'])); c.commit(); c.close(); return send(self,200,{'success':True,'msg':'اطلاعات ورود تغییر کرد؛ دوباره وارد شوید'})
+            except sqlite3.IntegrityError: c.close(); return send(self,409,{'success':False,'msg':'این نام کاربری قبلاً وجود دارد'})
+        if p=='/api/admin/users/create':
+            if not is_admin(self): return send(self,403,{'success':False,'msg':'فقط ادمین دسترسی دارد'})
+            try:d=body(self); nu=str(d.get('username','')).strip(); np=str(d.get('password','')); role=str(d.get('role','user'))
+            except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
+            if len(nu)<3 or len(np)<4 or role not in ('admin','user'): return send(self,400,{'success':False,'msg':'نام کاربری/رمز/نقش نامعتبر است'})
+            c=db()
+            try:c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(nu,hash_password(np),role,1,int(time.time()))); c.commit(); c.close(); return send(self,201,{'success':True})
+            except sqlite3.IntegrityError:c.close(); return send(self,409,{'success':False,'msg':'این نام کاربری قبلاً وجود دارد'})
+        if p.startswith('/api/admin/users/') and p.endswith('/toggle'):
+            if not is_admin(self): return send(self,403,{'success':False,'msg':'فقط ادمین دسترسی دارد'})
+            try:uid=int(p.split('/')[4])
+            except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})
+            if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'نمی‌توان اکانت فعلی را غیرفعال کرد'})
+            c=db(); c.execute('UPDATE panel_users SET enabled=1-enabled WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
+        if p.startswith('/api/admin/users/') and p.endswith('/delete'):
+            if not is_admin(self): return send(self,403,{'success':False,'msg':'فقط ادمین دسترسی دارد'})
+            try:uid=int(p.split('/')[4])
+            except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})
+            if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'اکانت فعلی را نمی‌توان حذف کرد'})
+            c=db(); c.execute('DELETE FROM panel_users WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
         if p=='/api/settings':
-            try:d=body(self); allowed={'node_host','node_port','ws_path','sub_path','panel_title','support_url','announce','update_interval'}
+            try:d=body(self); allowed={'node_host','node_port','ws_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server'}
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
             if 'node_port' in d:
                 try: port=int(d['node_port']); assert 1<=port<=65535
@@ -303,11 +376,11 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0))
-                if not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); dns_server=str(d.get('dnsServer','')).strip() or settings().get('dns_server','1.1.1.1')
+                if protocol not in ('vless','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
             except:return send(self,400,{'success':False,'msg':'نام، حجم و مدت را درست وارد کنید'})
             now=int(time.time()); r=(name,str(uuid.uuid4()),secrets.token_urlsafe(18),gb,days,now,now+days*86400)
-            c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at) VALUES(?,?,?,?,?,?,?)',r); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
+            c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address) VALUES(?,?,?,?,?,?,?,?,?,?,?)',r+ (protocol,dns_server,'','10.66.0.2/32')); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
         if p.startswith('/api/clients/') and p.endswith('/toggle'):
             try:cid=int(p.split('/')[3])
             except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})

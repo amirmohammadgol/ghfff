@@ -39,3 +39,13 @@ Xray StatsService برای upload/download فعال است. مصرف هر کار
 
 ## Default login
 `admin / admin` — بعد از اولین Deploy حتماً رمز را در Variables عوض کن.
+
+## نسخه مدیریت اکانت و پروتکل‌ها
+- حساب‌های پنل در SQLite نگهداری می‌شوند.
+- اولین اکانت از `VPNSTAN_USERNAME` و `VPNSTAN_PASSWORD` ساخته می‌شود و نقش آن `admin` است.
+- ادمین می‌تواند اکانت پنل بسازد، نقش user/admin بدهد، فعال/غیرفعال کند و حذف کند.
+- هر کاربر می‌تواند از «حساب من» نام کاربری و رمز عبور خود را تغییر دهد.
+- برای کلاینت‌ها پروتکل‌های VLESS، WireGuard و DNS در رابط پنل قابل انتخاب‌اند.
+- VLESS تنها پروتکل این نسخه است که از مسیر HTTP/HTTPS + WebSocket روی Railway به‌صورت مستقیم توسط Xray سرو می‌شود.
+- WireGuard به‌صورت پروفایل و تنظیمات Endpoint/Public Key در پنل پشتیبانی می‌شود؛ برای اتصال عمومی باید یک Endpoint WireGuard واقعی با مسیر شبکه مناسب داشته باشید. دامنه HTTP عمومی Railway برای عبور UDP WireGuard کافی نیست؛ Railway برای سرویس‌های غیرHTTP قابلیت TCP Proxy دارد و HTTP/HTTPS و TCP را جداگانه مسیریابی می‌کند.
+- DNS در این نسخه به‌عنوان Resolver/تنظیم DNS برای پروفایل ثبت می‌شود و خودش یک تونل VPN مستقل نیست.
