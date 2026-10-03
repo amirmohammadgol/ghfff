@@ -13,6 +13,8 @@ SUB_PATH=os.environ.get('VPNSTAN_SUB_PATH','sub')
 XRAY_BIN=os.environ.get('XRAY_BIN','/usr/local/bin/xray')
 XRAY_CONFIG=os.environ.get('XRAY_CONFIG','/data/xray.json')
 XRAY_INBOUND_PORT=int(os.environ.get('XRAY_INBOUND_PORT','10000'))
+XRAY_VMESS_PORT=int(os.environ.get('XRAY_VMESS_PORT','10001'))
+DEFAULT_VMESS_PATH=os.environ.get('VPNSTAN_VMESS_PATH','/vmess')
 XRAY_API_ADDR=os.environ.get('XRAY_API_ADDR','127.0.0.1:10085')
 SESSIONS={}
 XRAY_PROC=None
@@ -51,7 +53,7 @@ def init_db():
         import hashlib
         ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
         c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
-    defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'sub_path':SUB_PATH,
+    defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'sub_path':SUB_PATH,
               'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
@@ -145,11 +147,19 @@ def collect_xray_stats():
 
 def write_xray_config():
     os.makedirs(os.path.dirname(XRAY_CONFIG),exist_ok=True)
-    s=settings(); path=s.get('ws_path','/ws') or '/ws'
-    vclients=[{'id':r['uuid'],'email':r['name'],'level':0} for r in active_clients() if (r['protocol'] or 'vless')=='vless']
-    inbounds=[{'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
-        'settings':{'clients':vclients,'decryption':'none'},
-        'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':path}}}]
+    s=settings(); vpath=s.get('ws_path','/ws') or '/ws'; mpath=s.get('vmess_path','/vmess') or '/vmess'
+    rows=active_clients()
+    vclients=[{'id':r['uuid'],'email':r['name'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless']
+    mclients=[{'id':r['uuid'],'email':r['name'],'level':0,'alterId':0} for r in rows if (r['protocol'] or 'vless')=='vmess']
+    inbounds=[]
+    if vclients:
+        inbounds.append({'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
+            'settings':{'clients':vclients,'decryption':'none'},
+            'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':vpath}}})
+    if mclients:
+        inbounds.append({'tag':'vmess-ws','listen':'127.0.0.1','port':XRAY_VMESS_PORT,'protocol':'vmess',
+            'settings':{'clients':mclients},
+            'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':mpath}}})
     cfg={'log':{'loglevel':'warning'},'api':{'tag':'api','listen':XRAY_API_ADDR,'services':['StatsService']},'stats':{},
       'policy':{'levels':{'0':{'statsUserUplink':True,'statsUserDownlink':True,'statsUserOnline':True}},'system':{'statsInboundUplink':True,'statsInboundDownlink':True}},
       'inbounds':inbounds,'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
@@ -214,12 +224,16 @@ def host_for(h,s):
 
 def link_for(h,r,s):
     proto=(r['protocol'] if 'protocol' in r.keys() else 'vless') or 'vless'
-    host=host_for(h,s)
+    host=host_for(h,s); name=urllib.parse.quote(r['name'])
     if proto=='wireguard': return wg_config_for(h,r,s)
-    if proto=='dns': return f'dns://{r["dns_server"] or s.get("dns_server","1.1.1.1")}:53#{urllib.parse.quote(r["name"])}'
-    port=int(s.get('node_port','443')); path=s.get('ws_path','/ws') or '/ws'
+    if proto=='dns': return f'dns://{r["dns_server"] or s.get("dns_server","1.1.1.1")}:53#{name}'
+    port=int(s.get('node_port','443'));
+    if proto=='vmess':
+        obj={'v':'2','ps':r['name'],'add':host,'port':str(port),'id':r['uuid'],'aid':'0','scy':'auto','net':'ws','type':'none','host':host,'path':s.get('vmess_path','/vmess') or '/vmess','tls':'tls','sni':host}
+        return 'vmess://'+base64.b64encode(json.dumps(obj,separators=(',',':'),ensure_ascii=False).encode()).decode()
+    path=s.get('ws_path','/ws') or '/ws'
     qp=urllib.parse.urlencode({'encryption':'none','security':'tls','type':'ws','host':host,'path':path,'sni':host},safe='/')
-    return f'vless://{r["uuid"]}@{host}:{port}?{qp}#{urllib.parse.quote(r["name"])}'
+    return f'vless://{r["uuid"]}@{host}:{port}?{qp}#{name}'
 
 def wg_config_for(h,r,s):
     endpoint=s.get('wg_endpoint','') or 'SET-WIREGUARD-ENDPOINT:51820'
@@ -236,7 +250,7 @@ def client_data(h,r,s):
     return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
-            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1'),'wireguardConfig':wg_config_for(h,r,s)}
+            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1'),'wireguardConfig':wg_config_for(h,r,s)}
 
 def load_sub(h,sid):
     s=settings(); c=db(); rows=c.execute('SELECT * FROM clients WHERE sub_id=? AND enabled=1',(sid,)).fetchall(); c.close(); now=int(time.time())
@@ -252,11 +266,11 @@ def sub_page(h,sid):
     support=html.escape(s.get('support_url',''),quote=True); announce=html.escape(s.get('announce',''))
     qr=f'/qr/{r["sub_id"]}'
     page=f'''<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#0b1020"><title>{title} — {name}</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#070b14;color:#e8eefc;font-family:Tahoma,Arial,sans-serif}}.wrap{{max-width:920px;margin:auto;padding:28px 16px 50px}}.card{{background:linear-gradient(145deg,#111827,#0b1220);border:1px solid #26324a;border-radius:22px;padding:24px;box-shadow:0 18px 50px #0006;margin-bottom:16px}}.top{{display:flex;justify-content:space-between;gap:15px;align-items:center}}.brand{{font-size:22px;font-weight:800}}.muted{{color:#91a0bb;font-size:13px}}h1{{font-size:25px;margin:8px 0}}h2{{font-size:17px;margin:0 0 16px}}.badge{{padding:7px 12px;border-radius:999px;background:#17233a;color:#9db8ff;font-size:12px}}.online{{color:#58e0a0}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}.stat{{background:#0a1120;border:1px solid #202d43;border-radius:16px;padding:15px}}.stat b{{display:block;font-size:18px;margin-top:6px}}.bar{{height:10px;background:#1b2639;border-radius:99px;overflow:hidden;margin:12px 0}}.fill{{height:100%;background:linear-gradient(90deg,#5b8cff,#7b5cff);border-radius:99px}}.row{{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #202b3d;font-size:13px}}.row:last-child{{border:0}}.code{{direction:ltr;text-align:left;background:#050811;border:1px solid #202a3c;border-radius:14px;padding:13px;word-break:break-all;font-family:Consolas,monospace;font-size:12px;color:#bcd0ff}}button,a.btn{{display:inline-block;border:0;border-radius:12px;padding:11px 15px;background:#5b72ff;color:#fff;cursor:pointer;text-decoration:none;font-weight:700;margin-top:10px}}button.secondary{{background:#18243a}}.qr{{width:170px;height:170px;background:#fff;border-radius:12px;padding:8px;display:block;margin:8px auto}}.announce{{background:#0d1729;border:1px dashed #30415f;border-radius:14px;padding:12px;color:#b9c7dd;font-size:13px}}@media(max-width:700px){{.grid{{grid-template-columns:repeat(2,1fr)}}.top{{align-items:flex-start}}}}
-</style></head><body><div class="wrap"><div class="card"><div class="top"><div><div class="brand">{title}</div><div class="muted">صفحه اشتراک حرفه‌ای</div></div><div class="badge {'online' if d['online'] else ''}">● {status}</div></div><h1>{name}</h1><div class="muted">شناسه اشتراک: {html.escape(r['sub_id'])}</div></div>
+*{{box-sizing:border-box}}body{{margin:0;background:#070b14;color:#e8eefc;font-family:Tahoma,Arial,sans-serif}}.wrap{{max-width:920px;margin:auto;padding:28px 16px 50px}}.card{{background:linear-gradient(145deg,#111827,#0b1220);border:1px solid #26324a;border-radius:22px;padding:24px;box-shadow:0 18px 50px #0006;margin-bottom:16px}}.qr-card{{text-align:center}}.qr-card .qr{{box-shadow:0 8px 30px #0005}}.top{{display:flex;justify-content:space-between;gap:15px;align-items:center}}.brand{{font-size:22px;font-weight:800}}.muted{{color:#91a0bb;font-size:13px}}h1{{font-size:25px;margin:8px 0}}h2{{font-size:17px;margin:0 0 16px}}.badge{{padding:7px 12px;border-radius:999px;background:#17233a;color:#9db8ff;font-size:12px}}.online{{color:#58e0a0}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}}.stat{{background:#0a1120;border:1px solid #202d43;border-radius:16px;padding:15px}}.stat b{{display:block;font-size:18px;margin-top:6px}}.bar{{height:10px;background:#1b2639;border-radius:99px;overflow:hidden;margin:12px 0}}.fill{{height:100%;background:linear-gradient(90deg,#5b8cff,#7b5cff);border-radius:99px}}.row{{display:flex;justify-content:space-between;gap:10px;padding:10px 0;border-bottom:1px solid #202b3d;font-size:13px}}.row:last-child{{border:0}}.code{{direction:ltr;text-align:left;background:#050811;border:1px solid #202a3c;border-radius:14px;padding:13px;word-break:break-all;font-family:Consolas,monospace;font-size:12px;color:#bcd0ff}}button,a.btn{{display:inline-block;border:0;border-radius:12px;padding:11px 15px;background:#5b72ff;color:#fff;cursor:pointer;text-decoration:none;font-weight:700;margin-top:10px}}button.secondary{{background:#18243a}}.qr{{width:170px;height:170px;background:#fff;border-radius:12px;padding:8px;display:block;margin:8px auto}}.announce{{background:#0d1729;border:1px dashed #30415f;border-radius:14px;padding:12px;color:#b9c7dd;font-size:13px}}@media(max-width:700px){{.grid{{grid-template-columns:repeat(2,1fr)}}.top{{align-items:flex-start}}}}
+</style></head><body><div class="wrap"><div class="card"><div class="top"><div><div class="brand">{title}</div><div class="muted">Subscription • {proto}</div></div><div class="badge {'online' if d['online'] else ''}">● {status}</div></div><h1>{name}</h1><div class="muted">شناسه اشتراک: {html.escape(r['sub_id'])}</div></div>
 <div class="card"><h2>وضعیت مصرف</h2><div class="grid"><div class="stat"><span class="muted">حجم کل</span><b>{d['totalText']}</b></div><div class="stat"><span class="muted">مصرف‌شده</span><b>{d['usedText']}</b></div><div class="stat"><span class="muted">باقی‌مانده</span><b>{d['remainingText']}</b></div><div class="stat"><span class="muted">انقضا</span><b>{html.escape(d['expiryText'])}</b></div></div><div class="bar"><div class="fill" style="width:{pct:.1f}%"></div></div><div class="row"><span>دانلود</span><b>{d['downloadText']}</b></div><div class="row"><span>آپلود</span><b>{d['uploadText']}</b></div></div>
-<div class="card"><h2>کانفیگ {proto}</h2><div class="code" id="cfg">{link}</div><button onclick="copyText('cfg')">کپی کانفیگ</button><button class="secondary" onclick="copyText('sub')">کپی لینک اشتراک</button><div id="sub" class="code" style="margin-top:10px">{sub}</div></div>
-<div class="card"><h2>QR کانفیگ</h2><img class="qr" src="{qr}" alt="QR"><div class="muted" style="text-align:center">اسکن برای دریافت لینک کانفیگ</div></div>
+<div class="card"><h2>کانفیگ آماده</h2><div class="muted" style="margin:-8px 0 12px">{proto} • آماده برای کپی یا اسکن</div><div class="code" id="cfg">{link}</div><button onclick="copyText('cfg')">کپی کانفیگ</button><button class="secondary" onclick="copyText('sub')">کپی لینک اشتراک</button><div id="sub" class="code" style="margin-top:10px">{sub}</div></div>
+<div class="card qr-card"><h2>اتصال سریع</h2><img class="qr" src="{qr}" alt="QR"><div class="muted" style="text-align:center">QR را با کلاینت سازگار اسکن کن</div></div>
 <div class="card"><h2>جزئیات اتصال</h2><div class="row"><span>پروتکل</span><b>{proto}</b></div><div class="row"><span>Transport</span><b>{('WebSocket + TLS' if proto=='VLESS' else ('WireGuard' if proto=='WIREGUARD' else 'DNS Resolver'))}</b></div><div class="row"><span>مسیر</span><b>{html.escape(s.get('ws_path','/ws'))}</b></div><div class="row"><span>آخرین فعالیت</span><b>{fmt_date(d['lastSeen']) if d['lastSeen'] else 'هنوز ثبت نشده'}</b></div></div>
 <div class="announce">{announce}</div>{('<a class="btn" href="'+support+'">پشتیبانی</a>') if support else ''}</div><script>function copyText(id){{navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(()=>alert('کپی شد'))}}</script></body></html>'''
     raw=page.encode(); h.send_response(200); h.send_header('Content-Type','text/html; charset=utf-8'); h.send_header('Cache-Control','no-store'); h.send_header('Content-Length',str(len(raw))); h.end_headers(); h.wfile.write(raw)
@@ -293,8 +307,13 @@ class H(BaseHTTPRequestHandler):
             raw=enc.encode(); self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.send_header('Support-Url',s.get('support_url','')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/{s.get("sub_path","sub").strip("/")}/{sid}?html=1'); self.send_header('Announce',base64.b64encode(s.get('announce','').encode()).decode()); self.send_header('Content-Disposition',f'inline; filename="{sid}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if p.startswith('/qr/'): return qr_svg(self,p.split('/')[-1])
         if p.startswith('/subjson/'):
-            sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]
-            for r in rows: out.append({'protocol':'vless','tag':r['name'],'settings':{'vnext':[{'address':host_for(self,s),'port':int(s.get('node_port','443')),'users':[{'id':r['uuid'],'encryption':'none'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host_for(self,s)},'wsSettings':{'path':s.get('ws_path','/ws')}}})
+            sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]; host=host_for(self,s); port=int(s.get('node_port','443'))
+            for r in rows:
+                proto=(r['protocol'] or 'vless')
+                if proto=='vless':
+                    out.append({'protocol':'vless','tag':r['name'],'settings':{'vnext':[{'address':host,'port':port,'users':[{'id':r['uuid'],'encryption':'none'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host},'wsSettings':{'path':s.get('ws_path','/ws')}}})
+                elif proto=='vmess':
+                    out.append({'protocol':'vmess','tag':r['name'],'settings':{'vnext':[{'address':host,'port':port,'users':[{'id':r['uuid'],'alterId':0,'security':'auto'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host},'wsSettings':{'path':s.get('vmess_path','/vmess')}}})
             return send(self,200,out)
         if p=='/api/me':
             u=current_user(self); return send(self,200,{'authenticated':bool(u),'user':({'id':u['id'],'username':u['username'],'role':u['role']} if u else None)})
@@ -366,7 +385,7 @@ class H(BaseHTTPRequestHandler):
             if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'اکانت فعلی را نمی‌توان حذف کرد'})
             c=db(); c.execute('DELETE FROM panel_users WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
         if p=='/api/settings':
-            try:d=body(self); allowed={'node_host','node_port','ws_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server'}
+            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server'}
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
             if 'node_port' in d:
                 try: port=int(d['node_port']); assert 1<=port<=65535
@@ -376,8 +395,8 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); dns_server=str(d.get('dnsServer','')).strip() or settings().get('dns_server','1.1.1.1')
-                if protocol not in ('vless','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); dns_server=settings().get('dns_server','1.1.1.1')
+                if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
             except:return send(self,400,{'success':False,'msg':'نام، حجم و مدت را درست وارد کنید'})
             now=int(time.time()); r=(name,str(uuid.uuid4()),secrets.token_urlsafe(18),gb,days,now,now+days*86400)
             c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address) VALUES(?,?,?,?,?,?,?,?,?,?,?)',r+ (protocol,dns_server,'','10.66.0.2/32')); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
