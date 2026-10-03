@@ -77,7 +77,7 @@ def init_db():
         ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
         c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
     defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'sub_path':SUB_PATH,
-              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
+              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'1'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
 
@@ -140,9 +140,9 @@ def collect_xray_stats():
             email,kind=m.group(1),m.group(2); stats.setdefault(email,{'upload':0,'download':0})[kind]=value
     if not stats:return
     c=db(); now=int(time.time())
-    rows=c.execute('SELECT id,name FROM clients').fetchall()
+    rows=c.execute('SELECT id,uuid FROM clients').fetchall()
     for r in rows:
-        st=stats.get(r['name'])
+        st=stats.get('vpnstan-'+r['uuid'])
         if not st: continue
         old=c.execute('SELECT upload,download,last_seen,raw_upload,raw_download FROM traffic WHERE client_id=?',(r['id'],)).fetchone()
         if not old:
@@ -172,8 +172,8 @@ def write_xray_config():
     os.makedirs(os.path.dirname(XRAY_CONFIG),exist_ok=True)
     s=settings(); vpath=s.get('ws_path','/ws') or '/ws'; mpath=s.get('vmess_path','/vmess') or '/vmess'
     rows=active_clients()
-    vclients=[{'id':r['uuid'],'email':r['name'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless']
-    mclients=[{'id':r['uuid'],'email':r['name'],'level':0,'alterId':0} for r in rows if (r['protocol'] or 'vless')=='vmess']
+    vclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless']
+    mclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0,'alterId':0} for r in rows if (r['protocol'] or 'vless')=='vmess']
     inbounds=[]
     if vclients:
         inbounds.append({'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
@@ -215,9 +215,9 @@ def collector_loop():
     while True:
         try:
             with XRAY_LOCK:
-                before=[(r['id'],int(r['enabled'])) for r in db().execute('SELECT id,enabled FROM clients').fetchall()]
+                c1=db(); before=[(r['id'],int(r['enabled'])) for r in c1.execute('SELECT id,enabled FROM clients').fetchall()]; c1.close()
                 collect_xray_stats()
-                after=[(r['id'],int(r['enabled'])) for r in db().execute('SELECT id,enabled FROM clients').fetchall()]
+                c2=db(); after=[(r['id'],int(r['enabled'])) for r in c2.execute('SELECT id,enabled FROM clients').fetchall()]; c2.close()
                 if before != after:
                     write_xray_config()
                     if XRAY_PROC and XRAY_PROC.poll() is None:
@@ -227,7 +227,7 @@ def collector_loop():
                         log=open('/data/xray.log','ab')
                         globals()['XRAY_PROC']=subprocess.Popen([XRAY_BIN,'run','-c',XRAY_CONFIG],stdout=log,stderr=log)
         except Exception as e: print('STATS ERROR:',e,flush=True)
-        time.sleep(15)
+        time.sleep(1)
 
 def authed(h):
     return current_user(h) is not None
@@ -317,19 +317,25 @@ class H(BaseHTTPRequestHandler):
     def do_HEAD(self):
         u=urllib.parse.urlparse(self.path); p=u.path
         if p.startswith('/sub/'):
+            # Refresh Xray counters immediately before serving the subscription.
+            with XRAY_LOCK:
+                collect_xray_stats()
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows:self.send_response(404); self.end_headers(); return
-            r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); exp=r['expiry_at']; self.send_response(200); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.end_headers(); return
+            r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); exp=r['expiry_at']; self.send_response(200); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.end_headers(); return
         self.send_response(404); self.end_headers()
     def do_GET(self):
         u=urllib.parse.urlparse(self.path); p=u.path; q=urllib.parse.parse_qs(u.query)
         if p in ('/health','/api/health'): return send(self,200,{'ok':True,'name':'vpnstan','independent':True,'xray': bool(XRAY_PROC and XRAY_PROC.poll() is None)})
         if p.startswith('/sub/'):
+            # Always take a fresh Xray stats snapshot before returning a subscription.
+            with XRAY_LOCK:
+                collect_xray_stats()
             sid=p.split('/')[-1]
             if q.get('html')==['1'] or 'text/html' in self.headers.get('Accept',''):
                 return sub_page(self,sid)
             s,rows=load_sub(self,sid); links=[link_for(self,r,s) for r in rows]; enc=base64.b64encode('\n'.join(links).encode()).decode(); total=sum(int(float(r['gb'])*1024**3) for r in rows); up=sum(traffic_for(r['id'])['upload'] for r in rows); down=sum(traffic_for(r['id'])['download'] for r in rows); exp=max([r['expiry_at'] for r in rows],default=0)
-            raw=enc.encode(); self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.send_header('Support-Url',s.get('support_url','')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/{s.get("sub_path","sub").strip("/")}/{sid}?html=1'); self.send_header('Announce',base64.b64encode(s.get('announce','').encode()).decode()); self.send_header('Content-Disposition',f'inline; filename="{sid}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            raw=enc.encode(); self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Support-Url',s.get('support_url','')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/{s.get("sub_path","sub").strip("/")}/{sid}?html=1'); self.send_header('Announce',base64.b64encode(s.get('announce','').encode()).decode()); self.send_header('Content-Disposition',f'inline; filename="{sid}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if p.startswith('/dns-query/'):
             token=p.split('/')[-1]
             c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol="dns" AND enabled=1',(token,)).fetchone(); c.close()
@@ -352,11 +358,13 @@ class H(BaseHTTPRequestHandler):
             dns_usage_add(r['id'],len(qbytes)+len(answer))
             self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
         if p.startswith('/dns-sub/'):
+            with XRAY_LOCK:
+                collect_xray_stats()
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows:return send(self,404,{'error':'not found'})
             r=rows[0]; total=int(float(r['gb'])*1024**3); tr=traffic_for(r['id']); exp=r['expiry_at']; doh=f'https://{host_for(self,s)}/dns-query/{r["dns_token"]}'
             raw=(doh+'\n').encode()
-            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode((s.get('panel_title','vpnstan')+' DNS').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/dns/{r["sub_id"]}'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode((s.get('panel_title','vpnstan')+' DNS').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/dns/{r["sub_id"]}'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if p.startswith('/dns/'):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows:return send(self,404,{'error':'not found'})
