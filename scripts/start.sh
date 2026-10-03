@@ -1,9 +1,6 @@
 #!/bin/sh
 set -eu
-mkdir -p /data /run/nginx /var/lib/unbound /etc/unbound
-if [ ! -s /etc/unbound/root.key ] && command -v unbound-anchor >/dev/null 2>&1; then
-  unbound-anchor -a /etc/unbound/root.key || true
-fi
+mkdir -p /data /run/nginx /var/lib/unbound
 cat > /etc/unbound/unbound.conf <<'UNBOUND'
 server:
     interface: 127.0.0.1
@@ -18,12 +15,10 @@ server:
     hide-version: yes
     prefetch: yes
     qname-minimisation: yes
+    harden-below-nxdomain: yes
     cache-min-ttl: 30
     cache-max-ttl: 86400
 UNBOUND
-if [ -s /etc/unbound/root.key ]; then
-  printf '    auto-trust-anchor-file: "/etc/unbound/root.key"\n' >> /etc/unbound/unbound.conf
-fi
 unbound-checkconf /etc/unbound/unbound.conf
 unbound -c /etc/unbound/unbound.conf
 

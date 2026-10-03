@@ -1,6 +1,6 @@
 FROM alpine:3.22
 ARG XRAY_VERSION=26.7.28
-RUN apk add --no-cache python3 py3-pip nginx ca-certificates curl unzip unbound unbound-anchor && \
+RUN apk add --no-cache python3 py3-pip nginx ca-certificates curl unzip unbound && \
     pip3 install --no-cache-dir --break-system-packages qrcode && \
     curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip && \
     unzip -q /tmp/xray.zip -d /tmp/xray && \
