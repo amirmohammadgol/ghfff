@@ -1,6 +1,27 @@
 #!/bin/sh
 set -eu
-mkdir -p /data /run/nginx
+mkdir -p /data /run/nginx /var/lib/unbound
+cat > /etc/unbound/unbound.conf <<'UNBOUND'
+server:
+    interface: 127.0.0.1
+    port: 5353
+    do-ip4: yes
+    do-ip6: yes
+    do-udp: yes
+    do-tcp: yes
+    access-control: 127.0.0.0/8 allow
+    root-hints: "/etc/unbound/root.hints"
+    auto-trust-anchor-file: "/etc/unbound/root.key"
+    hide-identity: yes
+    hide-version: yes
+    prefetch: yes
+    qname-minimisation: yes
+    cache-min-ttl: 30
+    cache-max-ttl: 86400
+UNBOUND
+unbound-checkconf /etc/unbound/unbound.conf
+unbound -c /etc/unbound/unbound.conf
+
 PORT="${PORT:-8080}"
 cat > /etc/nginx/http.d/default.conf <<NGINX
 server {

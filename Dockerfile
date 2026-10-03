@@ -1,11 +1,11 @@
 FROM alpine:3.22
 ARG XRAY_VERSION=26.7.28
-RUN apk add --no-cache python3 py3-pip nginx ca-certificates curl unzip && \
+RUN apk add --no-cache python3 py3-pip nginx ca-certificates curl unzip unbound && \
     pip3 install --no-cache-dir --break-system-packages qrcode && \
     curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip && \
     unzip -q /tmp/xray.zip -d /tmp/xray && \
     install -m 0755 /tmp/xray/xray /usr/local/bin/xray && \
-    rm -rf /tmp/xray /tmp/xray.zip
+    rm -rf /tmp/xray /tmp/xray.zip && curl -fsSL https://www.internic.net/domain/named.root -o /etc/unbound/root.hints && mkdir -p /etc/unbound
 WORKDIR /opt/vpnstan
 COPY web /opt/vpnstan/web
 COPY scripts/start.sh /start-vpnstan.sh

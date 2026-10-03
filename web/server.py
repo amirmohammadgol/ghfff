@@ -1,4 +1,4 @@
-import base64, hmac, json, os, secrets, sqlite3, subprocess, time, uuid, urllib.parse, threading, re, io, html
+import base64, hmac, json, os, secrets, sqlite3, subprocess, time, uuid, urllib.parse, threading, re, io, html, socket, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WEB=os.environ.get('VPNSTAN_WEB','/opt/vpnstan/web')
@@ -16,12 +16,44 @@ XRAY_INBOUND_PORT=int(os.environ.get('XRAY_INBOUND_PORT','10000'))
 XRAY_VMESS_PORT=int(os.environ.get('XRAY_VMESS_PORT','10001'))
 DEFAULT_VMESS_PATH=os.environ.get('VPNSTAN_VMESS_PATH','/vmess')
 XRAY_API_ADDR=os.environ.get('XRAY_API_ADDR','127.0.0.1:10085')
+PANEL_VERSION='v20'
+DNS_LISTEN_HOST=os.environ.get('VPNSTAN_DNS_LISTEN_HOST','127.0.0.1')
+DNS_LISTEN_PORT=int(os.environ.get('VPNSTAN_DNS_LISTEN_PORT','5353'))
 SESSIONS={}
 XRAY_PROC=None
 SESSION_USERS={}
 
 XRAY_LOCK=threading.RLock()
 
+# Free public resolvers. These are profiles, not dedicated DNS servers created by this panel.
+DNS_PROFILES={
+    "cloudflare": {"name":"Cloudflare","primary":"1.1.1.1","secondary":"1.0.0.1","dot":"one.one.one.one"},
+    "google": {"name":"Google","primary":"8.8.8.8","secondary":"8.8.4.4","dot":"dns.google"},
+    "quad9": {"name":"Quad9","primary":"9.9.9.9","secondary":"149.112.112.112","dot":"dns.quad9.net"},
+    "adguard": {"name":"AdGuard","primary":"94.140.14.14","secondary":"94.140.15.15","dot":"dns.adguard-dns.com"},
+}
+
+def dns_profile_for(value):
+    v=(value or '').strip().lower()
+    if ',' in v:
+        a,b=[x.strip() for x in v.split(',',1)]
+        return {"name":"Custom","primary":a,"secondary":b,"dot":""}
+    return DNS_PROFILES.get(v,DNS_PROFILES['cloudflare'])
+
+
+def dns_usage_add(client_id, nbytes):
+    if not client_id or nbytes <= 0: return
+    c=db(); c.execute("INSERT INTO traffic(client_id,upload,download,last_seen,raw_upload,raw_download) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET upload=upload+excluded.upload,last_seen=excluded.last_seen", (client_id,int(nbytes),0,int(time.time()),0,0)); c.commit(); c.close()
+
+def resolve_dns_wire(query):
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    sock.settimeout(4)
+    try:
+        sock.sendto(query,(DNS_LISTEN_HOST,DNS_LISTEN_PORT))
+        data,_=sock.recvfrom(65535)
+        return data
+    finally:
+        sock.close()
 
 def db():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
@@ -45,7 +77,7 @@ def init_db():
     for col in ('raw_upload','raw_download'):
         try: c.execute(f'ALTER TABLE traffic ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
-    for col,typ,default in [('protocol','TEXT',"'vless'"),('dns_server','TEXT',"'1.1.1.1'"),('wg_private_key','TEXT',"''"),('wg_address','TEXT',"''")]:
+    for col,typ,default in [('protocol','TEXT',"'vless'"),('dns_server','TEXT',"'1.1.1.1'"),('wg_private_key','TEXT',"''"),('wg_address','TEXT',"''"),('dns_token','TEXT',"''")]:
         try: c.execute(f'ALTER TABLE clients ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}')
         except sqlite3.OperationalError: pass
     # Seed the first administrator from environment variables, only on first startup.
@@ -54,7 +86,7 @@ def init_db():
         ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
         c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
     defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'sub_path':SUB_PATH,
-              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
+              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'6'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
 
@@ -226,7 +258,9 @@ def link_for(h,r,s):
     proto=(r['protocol'] if 'protocol' in r.keys() else 'vless') or 'vless'
     host=host_for(h,s); name=urllib.parse.quote(r['name'])
     if proto=='wireguard': return wg_config_for(h,r,s)
-    if proto=='dns': return f'dns://{r["dns_server"] or s.get("dns_server","1.1.1.1")}:53#{name}'
+    if proto=='dns':
+        dp=dns_profile_for(r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1'))
+        return dp['primary'] + '\n' + dp['secondary']
     port=int(s.get('node_port','443'));
     if proto=='vmess':
         obj={'v':'2','ps':r['name'],'add':host,'port':str(port),'id':r['uuid'],'aid':'0','scy':'auto','net':'ws','type':'none','host':host,'path':s.get('vmess_path','/vmess') or '/vmess','tls':'tls','sni':host}
@@ -250,7 +284,7 @@ def client_data(h,r,s):
     return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
-            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1'),'wireguardConfig':wg_config_for(h,r,s)}
+            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1'),'dnsProfile':dns_profile_for(r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1')),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
 
 def load_sub(h,sid):
     s=settings(); c=db(); rows=c.execute('SELECT * FROM clients WHERE sub_id=? AND enabled=1',(sid,)).fetchall(); c.close(); now=int(time.time())
@@ -305,6 +339,35 @@ class H(BaseHTTPRequestHandler):
                 return sub_page(self,sid)
             s,rows=load_sub(self,sid); links=[link_for(self,r,s) for r in rows]; enc=base64.b64encode('\n'.join(links).encode()).decode(); total=sum(int(float(r['gb'])*1024**3) for r in rows); up=sum(traffic_for(r['id'])['upload'] for r in rows); down=sum(traffic_for(r['id'])['download'] for r in rows); exp=max([r['expiry_at'] for r in rows],default=0)
             raw=enc.encode(); self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.send_header('Support-Url',s.get('support_url','')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/{s.get("sub_path","sub").strip("/")}/{sid}?html=1'); self.send_header('Announce',base64.b64encode(s.get('announce','').encode()).decode()); self.send_header('Content-Disposition',f'inline; filename="{sid}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+        if p.startswith('/dns-query/'):
+            token=p.split('/')[-1]
+            c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol="dns" AND enabled=1',(token,)).fetchone(); c.close()
+            if not r or (r['expiry_at'] and r['expiry_at']<=int(time.time())):
+                return send(self,404,{'error':'DNS profile not found or expired'})
+            qbytes=b''
+            if self.command=='POST':
+                n=min(int(self.headers.get('Content-Length','0')),65535); qbytes=self.rfile.read(n)
+            else:
+                val=urllib.parse.parse_qs(u.query).get('dns',[''])[0]
+                try: qbytes=base64.urlsafe_b64decode(val+'='*((4-len(val)%4)%4))
+                except Exception: qbytes=b''
+            if not qbytes or len(qbytes)>65535:
+                return send(self,400,{'error':'invalid DNS query'})
+            try: answer=resolve_dns_wire(qbytes)
+            except Exception as e: return send(self,502,{'error':'DNS resolver unavailable','detail':str(e)})
+            dns_usage_add(r['id'],len(qbytes)+len(answer))
+            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
+        if p.startswith('/dns-sub/'):
+            sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
+            if not rows:return send(self,404,{'error':'not found'})
+            r=rows[0]; total=int(float(r['gb'])*1024**3); tr=traffic_for(r['id']); exp=r['expiry_at']; doh=f'https://{host_for(self,s)}/dns-query/{r["dns_token"]}'
+            raw=(doh+'\n').encode()
+            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode((s.get('panel_title','vpnstan')+' DNS').encode()).decode()); self.send_header('Profile-Update-Interval',s.get('update_interval','6')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/dns/{r["sub_id"]}'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+        if p.startswith('/dns/'):
+            sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
+            if not rows:return send(self,404,{'error':'not found'})
+            r=rows[0]; dp=dns_profile_for(r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1')); d=client_data(self,r,s); title=html.escape(s.get('panel_title','vpnstan')); name=html.escape(r['name']);
+            page=f'''<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} DNS</title><style>body{{margin:0;background:#0a1020;color:#eef3ff;font-family:Tahoma,Arial}}.wrap{{max-width:760px;margin:auto;padding:24px}}.card{{background:#111a2d;border:1px solid #263654;border-radius:20px;padding:24px;margin:14px 0}}.ip{{direction:ltr;text-align:center;font:700 28px Consolas;padding:18px;background:#0a1222;border-radius:14px;margin:10px 0}}.muted{{color:#9aabc7}}button{{border:0;border-radius:12px;padding:12px 18px;background:#6178ff;color:white;font-weight:700;cursor:pointer}}</style><div class=wrap><div class=card><div class=muted>DNS Subscription</div><h1>{name}</h1><p class=muted>پروفایل: {dp['name']} • قابل استفاده در DNS Changer و تنظیمات DNS دستی</p><h3>Primary DNS</h3><div class=ip id=p>{dp['primary']}</div><h3>Secondary DNS</h3><div class=ip id=s>{dp['secondary']}</div><button onclick=copyAll()>کپی هر دو DNS</button></div><div class=card><b>حجم اختصاص‌داده‌شده: {d['totalText']}</b><p>باقی‌مانده ثبت‌شده: {d['remainingText']}</p><p>انقضا: {html.escape(d['expiryText'])}</p><h3>DNS اختصاصی شما</h3><div class=ip id=doh style='font-size:16px;word-break:break-all'>{d['dnsUrl']}</div><button onclick=copyDoh()>کپی لینک DNS</button><p class=muted>این لینک یک DNS-over-HTTPS واقعی از خود پنل است؛ هر پروفایل مسیر اختصاصی دارد و مصرف درخواست/پاسخ DNS برای سهمیه همان پروفایل ثبت می‌شود.</p></div></div><script>function copyAll(){{navigator.clipboard.writeText(document.getElementById('p').textContent.trim()+'\n'+document.getElementById('s').textContent.trim()).then(()=>alert('کپی شد'))}}function copyDoh(){{navigator.clipboard.writeText(document.getElementById('doh').textContent.trim()).then(()=>alert('کپی شد'))}}</script></html>'''.encode(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(page))); self.end_headers(); self.wfile.write(page); return
         if p.startswith('/qr/'): return qr_svg(self,p.split('/')[-1])
         if p.startswith('/subjson/'):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]; host=host_for(self,s); port=int(s.get('node_port','443'))
@@ -385,7 +448,7 @@ class H(BaseHTTPRequestHandler):
             if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'اکانت فعلی را نمی‌توان حذف کرد'})
             c=db(); c.execute('DELETE FROM panel_users WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
         if p=='/api/settings':
-            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server'}
+            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server','dns_profile'}
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
             if 'node_port' in d:
                 try: port=int(d['node_port']); assert 1<=port<=65535
@@ -395,11 +458,12 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); dns_server=settings().get('dns_server','1.1.1.1')
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); st=settings(); dns_profile=st.get('dns_profile','cloudflare'); dp=dns_profile_for(dns_profile); dns_server=(f'{dp["primary"]},{dp["secondary"]}' if protocol=='dns' else st.get('dns_server','1.1.1.1,1.0.0.1'))
                 if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
             except:return send(self,400,{'success':False,'msg':'نام، حجم و مدت را درست وارد کنید'})
             now=int(time.time()); r=(name,str(uuid.uuid4()),secrets.token_urlsafe(18),gb,days,now,now+days*86400)
-            c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address) VALUES(?,?,?,?,?,?,?,?,?,?,?)',r+ (protocol,dns_server,'','10.66.0.2/32')); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
+            dns_token=secrets.token_urlsafe(24) if protocol=='dns' else ''
+            c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address,dns_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',r+ (protocol,dns_server,'','10.66.0.2/32',dns_token)); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
         if p.startswith('/api/clients/') and p.endswith('/toggle'):
             try:cid=int(p.split('/')[3])
             except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})
