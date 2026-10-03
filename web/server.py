@@ -260,7 +260,7 @@ def link_for(h,r,s):
     if proto=='wireguard': return wg_config_for(h,r,s)
     if proto=='dns':
         token=r['dns_token'] or ''
-        return f'https://{host}/dns-query/{token}' if token else ''
+        return f'https://{host}/doh/{token}' if token else ''
     port=int(s.get('node_port','443'));
     if proto=='vmess':
         obj={'v':'2','ps':r['name'],'add':host,'port':str(port),'id':r['uuid'],'aid':'0','scy':'auto','net':'ws','type':'none','host':host,'path':s.get('vmess_path','/vmess') or '/vmess','tls':'tls','sni':host}
@@ -284,7 +284,7 @@ def client_data(h,r,s):
     return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
-            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','dnsProfile':dns_profile_for('internal'),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
+            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':f'https://{sub_host}/doh/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','dnsProfile':dns_profile_for('internal'),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/doh/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
 
 def load_sub(h,sid):
     s=settings(); c=db(); rows=c.execute('SELECT * FROM clients WHERE sub_id=? AND enabled=1',(sid,)).fetchall(); c.close(); now=int(time.time())
@@ -335,6 +335,11 @@ class H(BaseHTTPRequestHandler):
             if not rows:self.send_response(404); self.end_headers(); return
             r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); exp=r['expiry_at']; self.send_response(200); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Cache-Control','no-store, no-cache, must-revalidate'); self.end_headers(); return
         self.send_response(404); self.end_headers()
+    def do_OPTIONS(self):
+        p=urllib.parse.urlparse(self.path).path
+        if p.startswith('/dns-query') or p.startswith('/doh/'):
+            self.send_response(204); self.send_header('Access-Control-Allow-Origin','*'); self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS'); self.send_header('Access-Control-Allow-Headers','Content-Type,Accept'); self.end_headers(); return
+        self.send_response(204); self.end_headers()
     def do_GET(self):
         u=urllib.parse.urlparse(self.path); p=u.path; q=urllib.parse.parse_qs(u.query)
         if p in ('/health','/api/health'): return send(self,200,{'ok':True,'name':'vpnstan','independent':True,'xray': bool(XRAY_PROC and XRAY_PROC.poll() is None)})
@@ -347,8 +352,13 @@ class H(BaseHTTPRequestHandler):
                 return sub_page(self,sid)
             s,rows=load_sub(self,sid); links=[link_for(self,r,s) for r in rows]; enc=base64.b64encode('\n'.join(links).encode()).decode(); total=sum(int(float(r['gb'])*1024**3) for r in rows); up=sum(traffic_for(r['id'])['upload'] for r in rows); down=sum(traffic_for(r['id'])['download'] for r in rows); exp=max([r['expiry_at'] for r in rows],default=0)
             raw=enc.encode(); self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Cache-Control','no-store, no-cache, must-revalidate'); self.send_header('Support-Url',s.get('support_url','')); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/{s.get("sub_path","sub").strip("/")}/{sid}?html=1'); self.send_header('Announce',base64.b64encode(s.get('announce','').encode()).decode()); self.send_header('Content-Disposition',f'inline; filename="{sid}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
-        if p.startswith('/dns-query/'):
-            token=p.split('/')[-1]
+        if p.startswith('/dns-query/') or p == '/dns-query' or p.startswith('/doh/'):
+            if p.startswith('/doh/'):
+                token=p.split('/')[-1]
+            elif p.startswith('/dns-query/'):
+                token=p.split('/')[-1]
+            else:
+                token=q.get('token',[''])[0]
             c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol="dns" AND enabled=1',(token,)).fetchone(); c.close()
             if not r or (r['expiry_at'] and r['expiry_at']<=int(time.time())):
                 return send(self,404,{'error':'DNS اختصاصی پیدا نشد یا منقضی شده است'})
@@ -367,13 +377,13 @@ class H(BaseHTTPRequestHandler):
             try: answer=resolve_dns_wire(qbytes)
             except Exception as e: return send(self,502,{'error':'DNS resolver unavailable','detail':str(e)})
             dns_usage_add(r['id'],len(qbytes)+len(answer))
-            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
+            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Access-Control-Allow-Origin','*'); self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
         if p.startswith('/dns-sub/'):
             with XRAY_LOCK:
                 collect_xray_stats()
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows or (rows[0]['protocol'] or '').lower()!='dns':return send(self,404,{'error':'DNS subscription not found or expired'})
-            r=rows[0]; total=int(float(r['gb'])*1024**3); tr=traffic_for(r['id']); exp=r['expiry_at']; doh=f'https://{host_for(self,s)}/dns-query/{r["dns_token"]}'
+            r=rows[0]; total=int(float(r['gb'])*1024**3); tr=traffic_for(r['id']); exp=r['expiry_at']; doh=f'https://{host_for(self,s)}/doh/{r["dns_token"]}'
             if 'text/html' in self.headers.get('Accept',''):
                 self.send_response(302); self.send_header('Location',f'/dns/{r["sub_id"]}'); self.send_header('Cache-Control','no-store'); self.end_headers(); return
             raw=(doh+'\n').encode()
@@ -431,8 +441,13 @@ class H(BaseHTTPRequestHandler):
         p=urllib.parse.urlparse(self.path).path
         # DNS-over-HTTPS uses POST with Content-Type application/dns-message.
         # Handle it before panel authentication because the DNS token is the credential.
-        if p.startswith('/dns-query/'):
-            token=p.split('/')[-1]
+        if p.startswith('/dns-query/') or p == '/dns-query' or p.startswith('/doh/'):
+            if p.startswith('/doh/'):
+                token=p.split('/')[-1]
+            elif p.startswith('/dns-query/'):
+                token=p.split('/')[-1]
+            else:
+                token=q.get('token',[''])[0]
             c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol=\"dns\" AND enabled=1',(token,)).fetchone(); c.close()
             if not r or (r['expiry_at'] and r['expiry_at']<=int(time.time())):
                 return send(self,404,{'error':'DNS profile not found or expired'})
@@ -448,7 +463,7 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return send(self,502,{'error':'DNS resolver unavailable','detail':str(e)})
             dns_usage_add(r['id'],len(qbytes)+len(answer))
-            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
+            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Access-Control-Allow-Origin','*'); self.send_header('Access-Control-Allow-Methods','GET,POST,OPTIONS'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
         if p=='/api/login':
             try:d=body(self)
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
