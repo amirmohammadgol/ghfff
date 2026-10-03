@@ -137,7 +137,7 @@ def fmt_date(ts):
 def collect_xray_stats():
     if not os.path.exists(XRAY_BIN): return
     try:
-        raw=subprocess.check_output([XRAY_BIN,'api','statsquery','-s',XRAY_API_ADDR],stderr=subprocess.DEVNULL,timeout=5)
+        raw=subprocess.check_output([XRAY_BIN,'api','statsquery','--server='+XRAY_API_ADDR],stderr=subprocess.DEVNULL,timeout=5)
         data=json.loads(raw.decode('utf-8','replace'))
     except Exception:
         return
@@ -406,6 +406,26 @@ class H(BaseHTTPRequestHandler):
         return self.static()
     def do_POST(self):
         p=urllib.parse.urlparse(self.path).path
+        # DNS-over-HTTPS uses POST with Content-Type application/dns-message.
+        # Handle it before panel authentication because the DNS token is the credential.
+        if p.startswith('/dns-query/'):
+            token=p.split('/')[-1]
+            c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol=\"dns\" AND enabled=1',(token,)).fetchone(); c.close()
+            if not r or (r['expiry_at'] and r['expiry_at']<=int(time.time())):
+                return send(self,404,{'error':'DNS profile not found or expired'})
+            try:
+                n=min(int(self.headers.get('Content-Length','0')),65535)
+                qbytes=self.rfile.read(n)
+            except Exception:
+                return send(self,400,{'error':'invalid DNS query'})
+            if not qbytes or len(qbytes)>65535:
+                return send(self,400,{'error':'invalid DNS query'})
+            try:
+                answer=resolve_dns_wire(qbytes)
+            except Exception as e:
+                return send(self,502,{'error':'DNS resolver unavailable','detail':str(e)})
+            dns_usage_add(r['id'],len(qbytes)+len(answer))
+            self.send_response(200); self.send_header('Content-Type','application/dns-message'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length',str(len(answer))); self.end_headers(); self.wfile.write(answer); return
         if p=='/api/login':
             try:d=body(self)
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})

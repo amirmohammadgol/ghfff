@@ -49,3 +49,8 @@ Xray StatsService برای upload/download فعال است. مصرف هر کار
 - VLESS تنها پروتکل این نسخه است که از مسیر HTTP/HTTPS + WebSocket روی Railway به‌صورت مستقیم توسط Xray سرو می‌شود.
 - WireGuard به‌صورت پروفایل و تنظیمات Endpoint/Public Key در پنل پشتیبانی می‌شود؛ برای اتصال عمومی باید یک Endpoint WireGuard واقعی با مسیر شبکه مناسب داشته باشید. دامنه HTTP عمومی Railway برای عبور UDP WireGuard کافی نیست؛ Railway برای سرویس‌های غیرHTTP قابلیت TCP Proxy دارد و HTTP/HTTPS و TCP را جداگانه مسیریابی می‌کند.
 - DNS در این نسخه به‌عنوان Resolver/تنظیم DNS برای پروفایل ثبت می‌شود و خودش یک تونل VPN مستقل نیست.
+
+## v20.1 fixes
+- Fixed Xray stats API invocation to use `--server=127.0.0.1:10085`.
+- Fixed DNS-over-HTTPS POST handling so compatible DNS clients can send `application/dns-message` requests.
+- DNS token remains the per-profile credential; no public resolver IP is presented as the user's dedicated server.
