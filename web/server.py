@@ -25,20 +25,11 @@ SESSION_USERS={}
 
 XRAY_LOCK=threading.RLock()
 
-# Free public resolvers. These are profiles, not dedicated DNS servers created by this panel.
-DNS_PROFILES={
-    "cloudflare": {"name":"Cloudflare","primary":"1.1.1.1","secondary":"1.0.0.1","dot":"one.one.one.one"},
-    "google": {"name":"Google","primary":"8.8.8.8","secondary":"8.8.4.4","dot":"dns.google"},
-    "quad9": {"name":"Quad9","primary":"9.9.9.9","secondary":"149.112.112.112","dot":"dns.quad9.net"},
-    "adguard": {"name":"AdGuard","primary":"94.140.14.14","secondary":"94.140.15.15","dot":"dns.adguard-dns.com"},
-}
+# The panel provides its own per-client DNS-over-HTTPS endpoint.
+# Public DNS addresses are intentionally not exposed as a client DNS profile.
 
 def dns_profile_for(value):
-    v=(value or '').strip().lower()
-    if ',' in v:
-        a,b=[x.strip() for x in v.split(',',1)]
-        return {"name":"Custom","primary":a,"secondary":b,"dot":""}
-    return DNS_PROFILES.get(v,DNS_PROFILES['cloudflare'])
+    return {"name":"Private VPNSTAN DNS","primary":"","secondary":"","dot":""}
 
 
 def dns_usage_add(client_id, nbytes):
@@ -259,8 +250,8 @@ def link_for(h,r,s):
     host=host_for(h,s); name=urllib.parse.quote(r['name'])
     if proto=='wireguard': return wg_config_for(h,r,s)
     if proto=='dns':
-        dp=dns_profile_for(r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1'))
-        return dp['primary'] + '\n' + dp['secondary']
+        token=r['dns_token'] or ''
+        return f'https://{host}/dns-query/{token}' if token else ''
     port=int(s.get('node_port','443'));
     if proto=='vmess':
         obj={'v':'2','ps':r['name'],'add':host,'port':str(port),'id':r['uuid'],'aid':'0','scy':'auto','net':'ws','type':'none','host':host,'path':s.get('vmess_path','/vmess') or '/vmess','tls':'tls','sni':host}
@@ -284,7 +275,7 @@ def client_data(h,r,s):
     return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
-            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1'),'dnsProfile':dns_profile_for(r['dns_server'] or s.get('dns_server','1.1.1.1,1.0.0.1')),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
+            'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','dnsProfile':dns_profile_for('internal'),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/dns-query/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
 
 def load_sub(h,sid):
     s=settings(); c=db(); rows=c.execute('SELECT * FROM clients WHERE sub_id=? AND enabled=1',(sid,)).fetchall(); c.close(); now=int(time.time())
@@ -343,7 +334,10 @@ class H(BaseHTTPRequestHandler):
             token=p.split('/')[-1]
             c=db(); r=c.execute('SELECT * FROM clients WHERE dns_token=? AND protocol="dns" AND enabled=1',(token,)).fetchone(); c.close()
             if not r or (r['expiry_at'] and r['expiry_at']<=int(time.time())):
-                return send(self,404,{'error':'DNS profile not found or expired'})
+                return send(self,404,{'error':'DNS اختصاصی پیدا نشد یا منقضی شده است'})
+            tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); used=tr['upload']+tr['download']
+            if used >= total:
+                return send(self,429,{'error':'حجم DNS این کاربر تمام شده است'})
             qbytes=b''
             if self.command=='POST':
                 n=min(int(self.headers.get('Content-Length','0')),65535); qbytes=self.rfile.read(n)
@@ -478,7 +472,7 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); st=settings(); dns_profile=st.get('dns_profile','cloudflare'); dp=dns_profile_for(dns_profile); dns_server=(f'{dp["primary"]},{dp["secondary"]}' if protocol=='dns' else st.get('dns_server','1.1.1.1,1.0.0.1'))
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); st=settings(); dns_server=('internal' if protocol=='dns' else st.get('dns_server',''))
                 if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
             except:return send(self,400,{'success':False,'msg':'نام، حجم و مدت را درست وارد کنید'})
             now=int(time.time()); r=(name,str(uuid.uuid4()),secrets.token_urlsafe(18),gb,days,now,now+days*86400)
