@@ -77,7 +77,7 @@ def init_db():
         ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
         c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
     defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'sub_path':SUB_PATH,
-              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'1'}
+              'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'1','theme':'dark'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
 
@@ -126,39 +126,44 @@ def fmt_date(ts):
     return time.strftime('%Y/%m/%d %H:%M',time.localtime(ts))
 
 def collect_xray_stats():
+    # Poll Xray's cumulative per-user counters every second and persist deltas.
     if not os.path.exists(XRAY_BIN): return
     try:
-        raw=subprocess.check_output([XRAY_BIN,'api','statsquery','--server='+XRAY_API_ADDR],stderr=subprocess.DEVNULL,timeout=5)
-        data=json.loads(raw.decode('utf-8','replace'))
-    except Exception:
+        proc=subprocess.run([XRAY_BIN,'api','statsquery','--server='+XRAY_API_ADDR],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=5,check=False)
+        if proc.returncode != 0:
+            try:
+                with open('/data/xray-stats.log','ab') as f: f.write((proc.stderr or b'')[-4000:]+b"\n")
+            except Exception: pass
+            return
+        data=json.loads((proc.stdout or b'{}').decode('utf-8','replace'))
+    except Exception as e:
+        try:
+            with open('/data/xray-stats.log','a',encoding='utf-8') as f: f.write(str(e)+'\n')
+        except Exception: pass
         return
     stats={}
-    for item in data.get('stat',[]):
-        name=item.get('name',''); value=int(item.get('value',0) or 0)
+    for item in data.get('stat',[]) or []:
+        name=str(item.get('name','')); value=int(item.get('value',0) or 0)
         m=re.match(r'^user>>>(.+)>>>traffic>>>(uplink|downlink)$',name)
         if m:
-            email,kind=m.group(1),m.group(2); stats.setdefault(email,{'upload':0,'download':0})[kind]=value
-    if not stats:return
+            email,kind=m.group(1),m.group(2)
+            stats.setdefault(email,{'upload':0,'download':0})[kind]=value
+    if not stats: return
     c=db(); now=int(time.time())
     rows=c.execute('SELECT id,uuid FROM clients').fetchall()
     for r in rows:
-        st=stats.get('vpnstan-'+r['uuid'])
+        st=stats.get('vpnstan-'+r['uuid']) or stats.get(r['uuid'])
         if not st: continue
         old=c.execute('SELECT upload,download,last_seen,raw_upload,raw_download FROM traffic WHERE client_id=?',(r['id'],)).fetchone()
         if not old:
             total_u=0; total_d=0; delta_u=0; delta_d=0; last=0
         else:
             raw_u=int(old['raw_upload']); raw_d=int(old['raw_download'])
-            # Xray counters reset on each Xray restart. When that happens, use the new
-            # counter as the new baseline rather than subtracting it from cumulative usage.
             delta_u=(st['upload']-raw_u) if st['upload']>=raw_u else st['upload']
             delta_d=(st['download']-raw_d) if st['download']>=raw_d else st['download']
-            total_u=int(old['upload'])+max(0,delta_u)
-            total_d=int(old['download'])+max(0,delta_d)
+            total_u=int(old['upload'])+max(0,delta_u); total_d=int(old['download'])+max(0,delta_d)
             last=now if delta_u+delta_d>0 else int(old['last_seen'])
-        c.execute('''INSERT INTO traffic(client_id,upload,download,last_seen,raw_upload,raw_download) VALUES(?,?,?,?,?,?)
-                     ON CONFLICT(client_id) DO UPDATE SET upload=excluded.upload,download=excluded.download,last_seen=excluded.last_seen,raw_upload=excluded.raw_upload,raw_download=excluded.raw_download''',
-                  (r['id'],total_u,total_d,last,st['upload'],st['download']))
+        c.execute("INSERT INTO traffic(client_id,upload,download,last_seen,raw_upload,raw_download) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET upload=excluded.upload,download=excluded.download,last_seen=excluded.last_seen,raw_upload=excluded.raw_upload,raw_download=excluded.raw_download",(r['id'],total_u,total_d,last,st['upload'],st['download']))
     c.commit()
     rows=c.execute('SELECT id,gb,expiry_at,enabled FROM clients').fetchall()
     for r in rows:
@@ -183,9 +188,13 @@ def write_xray_config():
         inbounds.append({'tag':'vmess-ws','listen':'127.0.0.1','port':XRAY_VMESS_PORT,'protocol':'vmess',
             'settings':{'clients':mclients},
             'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':mpath}}})
-    cfg={'log':{'loglevel':'warning'},'api':{'tag':'api','listen':XRAY_API_ADDR,'services':['StatsService']},'stats':{},
-      'policy':{'levels':{'0':{'statsUserUplink':True,'statsUserDownlink':True,'statsUserOnline':True}},'system':{'statsInboundUplink':True,'statsInboundDownlink':True}},
-      'inbounds':inbounds,'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
+    api_port=int(XRAY_API_ADDR.rsplit(':',1)[-1])
+    api_inbound={'tag':'api','listen':'127.0.0.1','port':api_port,'protocol':'dokodemo-door','settings':{'address':'127.0.0.1'}}
+    cfg={'log':{'loglevel':'warning'},'api':{'tag':'api','services':['StatsService']},'stats':{},
+      'policy':{'levels':{'0':{'statsUserUplink':True,'statsUserDownlink':True,'statsUserOnline':True}},'system':{'statsInboundUplink':True,'statsInboundDownlink':True,'statsOutboundUplink':True,'statsOutboundDownlink':True}},
+      'inbounds':[api_inbound]+inbounds,
+      'routing':{'rules':[{'type':'field','inboundTag':['api'],'outboundTag':'api'}]},
+      'outbounds':[{'protocol':'freedom','tag':'direct'},{'protocol':'blackhole','tag':'block'}]}
     tmp=XRAY_CONFIG+'.tmp'
     with open(tmp,'w',encoding='utf-8') as f: json.dump(cfg,f,ensure_ascii=False,indent=2)
     os.replace(tmp,XRAY_CONFIG); return cfg
@@ -283,6 +292,8 @@ def load_sub(h,sid):
     return s,rows
 
 def sub_page(h,sid):
+    with XRAY_LOCK:
+        collect_xray_stats()
     s,rows=load_sub(h,sid)
     if not rows:
         h.send_response(404); h.send_header('Content-Type','text/html; charset=utf-8'); h.end_headers(); h.wfile.write('<h2>اشتراک پیدا نشد یا منقضی شده است.</h2>'.encode()); return
@@ -297,7 +308,7 @@ def sub_page(h,sid):
 <div class="card"><h2>کانفیگ آماده</h2><div class="muted" style="margin:-8px 0 12px">{proto} • آماده برای کپی یا اسکن</div><div class="code" id="cfg">{link}</div><button onclick="copyText('cfg')">کپی کانفیگ</button><button class="secondary" onclick="copyText('sub')">کپی لینک اشتراک</button><div id="sub" class="code" style="margin-top:10px">{sub}</div></div>
 <div class="card qr-card"><h2>اتصال سریع</h2><img class="qr" src="{qr}" alt="QR"><div class="muted" style="text-align:center">QR را با کلاینت سازگار اسکن کن</div></div>
 <div class="card"><h2>جزئیات اتصال</h2><div class="row"><span>پروتکل</span><b>{proto}</b></div><div class="row"><span>Transport</span><b>{('WebSocket + TLS' if proto=='VLESS' else ('WireGuard' if proto=='WIREGUARD' else 'DNS Resolver'))}</b></div><div class="row"><span>مسیر</span><b>{html.escape(s.get('ws_path','/ws'))}</b></div><div class="row"><span>آخرین فعالیت</span><b>{fmt_date(d['lastSeen']) if d['lastSeen'] else 'هنوز ثبت نشده'}</b></div></div>
-<div class="announce">{announce}</div>{('<a class="btn" href="'+support+'">پشتیبانی</a>') if support else ''}</div><script>function copyText(id){{navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(()=>alert('کپی شد'))}}</script></body></html>'''
+<div class="announce">{announce}</div>{('<a class="btn" href="'+support+'">پشتیبانی</a>') if support else ''}</div><script>function copyText(id){{navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(()=>alert('کپی شد'))}}async function live(){{try{{let r=await fetch('/sub-status/{r["sub_id"]}',{{cache:'no-store'}});if(!r.ok)return;let d=await r.json();let vals=document.querySelectorAll('.stat b');if(vals.length>=4){{vals[1].textContent=d.usedText;vals[2].textContent=d.remainingText}}let rows=document.querySelectorAll('.row b');if(rows.length>=3){{rows[0].textContent=d.downloadText;rows[1].textContent=d.uploadText;rows[2].textContent=d.lastSeen?new Date(d.lastSeen*1000).toLocaleString('fa-IR'):'هنوز ثبت نشده'}}let fill=document.querySelector('.fill');if(fill)fill.style.width=Math.min(100,d.percent)+'%';let badge=document.querySelector('.badge');if(badge){{badge.classList.toggle('online',!!d.online);badge.textContent=d.online?'● آنلاین':'● آفلاین'}}}}catch(e){{}}}}setInterval(live,1000);live();</script></body></html>'''
     raw=page.encode(); h.send_response(200); h.send_header('Content-Type','text/html; charset=utf-8'); h.send_header('Cache-Control','no-store'); h.send_header('Content-Length',str(len(raw))); h.end_headers(); h.wfile.write(raw)
 
 def qr_svg(h,sid):
@@ -361,16 +372,26 @@ class H(BaseHTTPRequestHandler):
             with XRAY_LOCK:
                 collect_xray_stats()
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
-            if not rows:return send(self,404,{'error':'not found'})
+            if not rows or (rows[0]['protocol'] or '').lower()!='dns':return send(self,404,{'error':'DNS subscription not found or expired'})
             r=rows[0]; total=int(float(r['gb'])*1024**3); tr=traffic_for(r['id']); exp=r['expiry_at']; doh=f'https://{host_for(self,s)}/dns-query/{r["dns_token"]}'
+            if 'text/html' in self.headers.get('Accept',''):
+                self.send_response(302); self.send_header('Location',f'/dns/{r["sub_id"]}'); self.send_header('Cache-Control','no-store'); self.end_headers(); return
             raw=(doh+'\n').encode()
-            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Cache-Control','no-store'); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode((s.get('panel_title','vpnstan')+' DNS').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/dns/{r["sub_id"]}'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            self.send_response(200); self.send_header('Content-Type','text/plain; charset=utf-8'); self.send_header('Cache-Control','no-store, no-cache, must-revalidate'); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode((s.get('panel_title','vpnstan')+' DNS').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Profile-Web-Page-Url',f'https://{host_for(self,s)}/dns/{r["sub_id"]}'); self.send_header('Content-Disposition',f'inline; filename="dns-{r["sub_id"]}.txt"'); self.send_header('Content-Length',str(len(raw))); self.end_headers(); self.wfile.write(raw); return
         if p.startswith('/dns/'):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows:return send(self,404,{'error':'not found'})
             r=rows[0]; d=client_data(self,r,s); title=html.escape(s.get('panel_title','vpnstan')); name=html.escape(r['name']);
-            page=f'''<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} DNS</title><style>body{{margin:0;background:#0a1020;color:#eef3ff;font-family:Tahoma,Arial}}.wrap{{max-width:760px;margin:auto;padding:24px}}.card{{background:#111a2d;border:1px solid #263654;border-radius:20px;padding:24px;margin:14px 0}}.code{{direction:ltr;text-align:left;font:600 15px Consolas;word-break:break-all;background:#070d18;border:1px solid #263654;border-radius:14px;padding:16px}}.muted{{color:#9aabc7}}button{{border:0;border-radius:12px;padding:12px 18px;background:#6178ff;color:white;font-weight:700;cursor:pointer}}</style><div class=wrap><div class=card><div class=muted>VPNSTAN • DNS اختصاصی</div><h1>{name}</h1><p class=muted>این اشتراک فقط برای DNS-over-HTTPS اختصاصی همین کاربر است.</p><h3>لینک DNS اختصاصی</h3><div class=code id=doh>{d['dnsUrl']}</div><button onclick=copyDoh()>کپی لینک DNS</button></div><div class=card><b>حجم اختصاص‌داده‌شده: {d['totalText']}</b><p>مصرف‌شده: {d['usedText']}</p><p>باقی‌مانده: {d['remainingText']}</p><p>دانلود: {d['downloadText']}</p><p>آپلود/درخواست DNS: {d['uploadText']}</p><p>انقضا: {html.escape(d['expiryText'])}</p><p class=muted>DNSهای عمومی مثل 1.1.1.1 و 8.8.8.8 در این اشتراک استفاده نمی‌شوند. حجم فقط برای درخواست‌هایی که از این لینک اختصاصی عبور کنند محاسبه می‌شود.</p></div></div><script>function copyDoh(){{navigator.clipboard.writeText(document.getElementById('doh').textContent.trim()).then(()=>alert('کپی شد'))}}</script></html>'''.encode().encode(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(page))); self.end_headers(); self.wfile.write(page); return
+            page=f'''<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Cache-Control" content="no-store"><title>{title} DNS</title><style>body{{margin:0;background:#0a1020;color:#eef3ff;font-family:Tahoma,Arial}}.wrap{{max-width:760px;margin:auto;padding:24px}}.card{{background:#111a2d;border:1px solid #263654;border-radius:20px;padding:24px;margin:14px 0}}.code{{direction:ltr;text-align:left;font:600 15px Consolas;word-break:break-all;background:#070d18;border:1px solid #263654;border-radius:14px;padding:16px}}.muted{{color:#9aabc7}}button{{border:0;border-radius:12px;padding:12px 18px;background:#6178ff;color:white;font-weight:700;cursor:pointer}}</style><div class=wrap><div class=card><div class=muted>VPNSTAN • DNS اختصاصی</div><h1>{name}</h1><p class=muted>این اشتراک فقط برای DNS-over-HTTPS اختصاصی همین کاربر است.</p><h3>لینک DNS اختصاصی</h3><div class=code id=doh>{d['dnsUrl']}</div><button onclick=copyDoh()>کپی لینک DNS</button></div><div class=card><b>حجم اختصاص‌داده‌شده: {d['totalText']}</b><p>مصرف‌شده: {d['usedText']}</p><p>باقی‌مانده: {d['remainingText']}</p><p>دانلود: {d['downloadText']}</p><p>آپلود/درخواست DNS: {d['uploadText']}</p><p>انقضا: {html.escape(d['expiryText'])}</p><p class=muted>DNSهای عمومی مثل 1.1.1.1 و 8.8.8.8 در این اشتراک استفاده نمی‌شوند. حجم فقط برای درخواست‌هایی که از این لینک اختصاصی عبور کنند محاسبه می‌شود.</p></div></div><script>function copyDoh(){{navigator.clipboard.writeText(document.getElementById('doh').textContent.trim()).then(()=>alert('کپی شد'))}}</script></html>'''.encode(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(page))); self.end_headers(); self.wfile.write(page); return
         if p.startswith('/qr/'): return qr_svg(self,p.split('/')[-1])
+        if p.startswith('/sub-status/'):
+            sid=p.split('/')[-1]
+            with XRAY_LOCK:
+                collect_xray_stats()
+            s,rows=load_sub(self,sid)
+            if not rows:return send(self,404,{'error':'subscription not found'})
+            r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); used=tr['upload']+tr['download']; remain=max(0,total-used)
+            return send(self,200,{'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'total':total,'usedText':fmt_bytes(used),'remainingText':fmt_bytes(remain),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),'percent':round((used/total*100) if total else 0,2),'online':bool(tr['last_seen'] and int(time.time())-tr['last_seen']<=20),'lastSeen':tr['last_seen']})
         if p.startswith('/subjson/'):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]; host=host_for(self,s); port=int(s.get('node_port','443'))
             for r in rows:
@@ -470,7 +491,7 @@ class H(BaseHTTPRequestHandler):
             if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'اکانت فعلی را نمی‌توان حذف کرد'})
             c=db(); c.execute('DELETE FROM panel_users WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
         if p=='/api/settings':
-            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server','dns_profile'}
+            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server','dns_profile','theme'}
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
             if 'node_port' in d:
                 try: port=int(d['node_port']); assert 1<=port<=65535
@@ -480,12 +501,34 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); st=settings(); dns_server=('internal' if protocol=='dns' else st.get('dns_server',''))
-                if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80: raise ValueError
-            except:return send(self,400,{'success':False,'msg':'نام، حجم و مدت را درست وارد کنید'})
-            now=int(time.time()); r=(name,str(uuid.uuid4()),secrets.token_urlsafe(18),gb,days,now,now+days*86400)
-            dns_token=secrets.token_urlsafe(24) if protocol=='dns' else ''
-            c=db(); c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address,dns_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',r+ (protocol,dns_server,'','10.66.0.2/32',dns_token)); c.commit(); row=c.execute('SELECT * FROM clients WHERE uuid=?',(r[1],)).fetchone(); c.close(); restart_xray(); return send(self,201,{'success':True,'client':client_data(self,row,settings())})
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); sub_count=int(d.get('subCount',1) or 1); st=settings(); dns_server=('internal' if protocol=='dns' else st.get('dns_server',''))
+                if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80 or sub_count<1 or sub_count>20: raise ValueError
+                if protocol=='dns' and sub_count!=1: raise ValueError
+            except:return send(self,400,{'success':False,'msg':'نام، حجم، مدت یا تعداد کانفیگ نامعتبر است'})
+            now=int(time.time()); sub_id=secrets.token_urlsafe(18); rows=[]
+            c=db()
+            for i in range(sub_count):
+                cname=name if sub_count==1 else f'{name}-{i+1:02d}'
+                cuuid=str(uuid.uuid4()); dns_token=secrets.token_urlsafe(24) if protocol=='dns' else ''
+                r=(cname,cuuid,sub_id,gb,days,now,now+days*86400,protocol,dns_server,'','10.66.0.2/32',dns_token)
+                c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address,dns_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',r)
+                rows.append(c.execute('SELECT * FROM clients WHERE uuid=?',(cuuid,)).fetchone())
+            c.commit(); c.close(); restart_xray(); first=rows[0]
+            return send(self,201,{'success':True,'count':sub_count,'subId':sub_id,'client':client_data(self,first,settings()),'clients':[client_data(self,r,settings()) for r in rows]})
+        if p.startswith('/api/clients/') and p.endswith('/edit'):
+            try:
+                cid=int(p.split('/')[3]); d=body(self)
+                name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower()
+                if not name or gb<=0 or days<=0 or len(name)>80 or protocol not in ('vless','vmess','wireguard','dns'): raise ValueError
+            except Exception:
+                return send(self,400,{'success':False,'msg':'نام، حجم، مدت یا پروتکل نامعتبر است'})
+            c=db(); old=c.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone()
+            if not old: c.close(); return send(self,404,{'success':False,'msg':'کلاینت پیدا نشد'})
+            expiry=int(time.time())+days*86400
+            dns_token=old['dns_token'] or (secrets.token_urlsafe(24) if protocol=='dns' else '')
+            if protocol!='dns': dns_token=''
+            dns_server='internal' if protocol=='dns' else ''
+            c.execute('UPDATE clients SET name=?,gb=?,days=?,expiry_at=?,protocol=?,dns_server=?,dns_token=?,enabled=1 WHERE id=?',(name,gb,days,expiry,protocol,dns_server,dns_token,cid)); c.commit(); row=c.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone(); c.close(); restart_xray(); return send(self,200,{'success':True,'client':client_data(self,row,settings())})
         if p.startswith('/api/clients/') and p.endswith('/toggle'):
             try:cid=int(p.split('/')[3])
             except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})
