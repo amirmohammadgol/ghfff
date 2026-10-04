@@ -1,3 +1,9 @@
+# VPNSTAN v21
+
+This build fixes per-user Xray traffic accounting (`uplink/downlink` mapping), makes multi-client subscriptions valid in SQLite, aggregates usage in `Subscription-Userinfo` and `/sub-status`, and adds VLESS + XHTTP as an HTTP transport behind the existing Railway reverse proxy.
+
+**Railway note:** REALITY is not enabled on the Railway HTTP ingress in this build because Railway terminates the public HTTPS connection before the service. REALITY requires end-to-end TLS handshake visibility at the Xray node. Use a direct TCP node for REALITY rather than advertising a configuration that cannot work.
+
 # vpnstan — Standalone Railway + Xray
 
 نسخه مستقل و بدون 3X-UI/WireGuard. پنل، Subscription و Xray Core در یک سرویس Railway اجرا می‌شوند.

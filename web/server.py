@@ -15,6 +15,7 @@ XRAY_CONFIG=os.environ.get('XRAY_CONFIG','/data/xray.json')
 XRAY_INBOUND_PORT=int(os.environ.get('XRAY_INBOUND_PORT','10000'))
 XRAY_VMESS_PORT=int(os.environ.get('XRAY_VMESS_PORT','10001'))
 DEFAULT_VMESS_PATH=os.environ.get('VPNSTAN_VMESS_PATH','/vmess')
+DEFAULT_XHTTP_PATH=os.environ.get('VPNSTAN_XHTTP_PATH','/xhttp')
 XRAY_API_ADDR=os.environ.get('XRAY_API_ADDR','127.0.0.1:10085')
 PANEL_VERSION='v20'
 DNS_LISTEN_HOST=os.environ.get('VPNSTAN_DNS_LISTEN_HOST','127.0.0.1')
@@ -54,8 +55,41 @@ def init_db():
     c=db()
     c.execute('''CREATE TABLE IF NOT EXISTS clients(
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, uuid TEXT NOT NULL UNIQUE,
-      sub_id TEXT NOT NULL UNIQUE, gb REAL NOT NULL, days INTEGER NOT NULL,
+      sub_id TEXT NOT NULL, gb REAL NOT NULL, days INTEGER NOT NULL,
       created_at INTEGER NOT NULL, expiry_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1)''')
+    # Older releases incorrectly made sub_id UNIQUE; migrate it so one subscription can contain multiple clients.
+    try:
+        unique_sub = False
+        for idx in c.execute("PRAGMA index_list(clients)").fetchall():
+            if int(idx[2] or 0):
+                cols = [r[2] for r in c.execute("PRAGMA index_info(%s)" % idx[1]).fetchall()]
+                if cols == ['sub_id']:
+                    unique_sub = True
+                    break
+        if unique_sub:
+            c.execute('''CREATE TABLE clients_migrate(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, uuid TEXT NOT NULL UNIQUE,
+              sub_id TEXT NOT NULL, gb REAL NOT NULL, days INTEGER NOT NULL,
+              created_at INTEGER NOT NULL, expiry_at INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+              protocol TEXT NOT NULL DEFAULT 'vless', transport TEXT NOT NULL DEFAULT 'ws', dns_server TEXT NOT NULL DEFAULT '1.1.1.1',
+              wg_private_key TEXT NOT NULL DEFAULT '', wg_address TEXT NOT NULL DEFAULT '',
+              dns_token TEXT NOT NULL DEFAULT '')''')
+            cols_now=[r[1] for r in c.execute("PRAGMA table_info(clients)").fetchall()]
+            extra=[x for x in ('protocol','transport','dns_server','wg_private_key','wg_address','dns_token') if x in cols_now]
+            if len(extra)==6:
+                c.execute('''INSERT INTO clients_migrate(id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled,protocol,transport,dns_server,wg_private_key,wg_address,dns_token)
+                             SELECT id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled,protocol,transport,dns_server,wg_private_key,wg_address,dns_token FROM clients''')
+            elif len(extra)==5:
+                c.execute('''INSERT INTO clients_migrate(id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled,protocol,dns_server,wg_private_key,wg_address,dns_token)
+                             SELECT id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled,protocol,dns_server,wg_private_key,wg_address,dns_token FROM clients''')
+            else:
+                c.execute('''INSERT INTO clients_migrate(id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled)
+                             SELECT id,name,uuid,sub_id,gb,days,created_at,expiry_at,enabled FROM clients''')
+            c.execute('DROP TABLE clients')
+            c.execute('ALTER TABLE clients_migrate RENAME TO clients')
+    except sqlite3.Error as e:
+        print('CLIENTS SCHEMA MIGRATION:', e, flush=True)
+
     c.execute('''CREATE TABLE IF NOT EXISTS panel_users(
       id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user',
@@ -68,7 +102,7 @@ def init_db():
     for col in ('raw_upload','raw_download'):
         try: c.execute(f'ALTER TABLE traffic ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
-    for col,typ,default in [('protocol','TEXT',"'vless'"),('dns_server','TEXT',"'1.1.1.1'"),('wg_private_key','TEXT',"''"),('wg_address','TEXT',"''"),('dns_token','TEXT',"''")]:
+    for col,typ,default in [('protocol','TEXT',"'vless'"),('transport','TEXT',"'ws'"),('dns_server','TEXT',"'1.1.1.1'"),('wg_private_key','TEXT',"''"),('wg_address','TEXT',"''"),('dns_token','TEXT',"''")]:
         try: c.execute(f'ALTER TABLE clients ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}')
         except sqlite3.OperationalError: pass
     # Seed the first administrator from environment variables, only on first startup.
@@ -76,7 +110,7 @@ def init_db():
         import hashlib
         ph=hashlib.sha256(PASSWORD.encode()).hexdigest()
         c.execute('INSERT INTO panel_users(username,password_hash,role,enabled,created_at) VALUES(?,?,?,?,?)',(USERNAME,ph,'admin',1,int(time.time())))
-    defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'sub_path':SUB_PATH,
+    defaults={'node_host':DEFAULT_HOST,'node_port':str(DEFAULT_PORT),'ws_path':DEFAULT_PATH,'vmess_path':DEFAULT_VMESS_PATH,'xhttp_path':DEFAULT_XHTTP_PATH,'sub_path':SUB_PATH,
               'panel_title':'vpnstan','support_url':'','dns_server':'1.1.1.1,1.0.0.1','dns_profile':'cloudflare','wg_endpoint':'','wg_server_public_key':'','announce':'اشتراک vpnstan — برای دریافت آخرین کانفیگ، لینک اشتراک را به‌روزرسانی کنید.','update_interval':'1','theme':'dark'}
     for k,v in defaults.items(): c.execute('INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)',(k,v))
     c.commit(); c.close()
@@ -147,8 +181,13 @@ def collect_xray_stats():
         m=re.match(r'^user>>>(.+)>>>traffic>>>(uplink|downlink)$',name)
         if m:
             email,kind=m.group(1),m.group(2)
-            stats.setdefault(email,{'upload':0,'download':0})[kind]=value
-    if not stats: return
+            stats.setdefault(email,{'upload':0,'download':0})['upload' if kind=='uplink' else 'download']=value
+    if not stats:
+        try:
+            with open('/data/xray-stats.log','a',encoding='utf-8') as f:
+                f.write(time.strftime('%Y-%m-%d %H:%M:%S ')+'statsquery returned no user counters\\n')
+        except Exception: pass
+        return
     c=db(); now=int(time.time())
     rows=c.execute('SELECT id,uuid FROM clients').fetchall()
     for r in rows:
@@ -175,15 +214,20 @@ def collect_xray_stats():
 
 def write_xray_config():
     os.makedirs(os.path.dirname(XRAY_CONFIG),exist_ok=True)
-    s=settings(); vpath=s.get('ws_path','/ws') or '/ws'; mpath=s.get('vmess_path','/vmess') or '/vmess'
+    s=settings(); vpath=s.get('ws_path','/ws') or '/ws'; xpath=s.get('xhttp_path','/xhttp') or '/xhttp'; mpath=s.get('vmess_path','/vmess') or '/vmess'
     rows=active_clients()
-    vclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless']
+    vclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless' and (r['transport'] or 'ws')=='ws']
+    xclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0} for r in rows if (r['protocol'] or 'vless')=='vless' and (r['transport'] or 'ws')=='xhttp']
     mclients=[{'id':r['uuid'],'email':'vpnstan-'+r['uuid'],'level':0,'alterId':0} for r in rows if (r['protocol'] or 'vless')=='vmess']
     inbounds=[]
     if vclients:
         inbounds.append({'tag':'vless-ws','listen':'127.0.0.1','port':XRAY_INBOUND_PORT,'protocol':'vless',
             'settings':{'clients':vclients,'decryption':'none'},
             'streamSettings':{'network':'ws','security':'none','wsSettings':{'path':vpath}}})
+    if xclients:
+        inbounds.append({'tag':'vless-xhttp','listen':'127.0.0.1','port':XRAY_INBOUND_PORT+2,'protocol':'vless',
+            'settings':{'clients':xclients,'decryption':'none'},
+            'streamSettings':{'network':'xhttp','security':'none','xhttpSettings':{'path':xpath,'mode':'auto'}}})
     if mclients:
         inbounds.append({'tag':'vmess-ws','listen':'127.0.0.1','port':XRAY_VMESS_PORT,'protocol':'vmess',
             'settings':{'clients':mclients},
@@ -265,6 +309,11 @@ def link_for(h,r,s):
     if proto=='vmess':
         obj={'v':'2','ps':r['name'],'add':host,'port':str(port),'id':r['uuid'],'aid':'0','scy':'auto','net':'ws','type':'none','host':host,'path':s.get('vmess_path','/vmess') or '/vmess','tls':'tls','sni':host}
         return 'vmess://'+base64.b64encode(json.dumps(obj,separators=(',',':'),ensure_ascii=False).encode()).decode()
+    transport=(r['transport'] or 'ws').lower() if 'transport' in r.keys() else 'ws'
+    if transport=='xhttp':
+        path=s.get('xhttp_path','/xhttp') or '/xhttp'
+        qp=urllib.parse.urlencode({'encryption':'none','security':'tls','type':'xhttp','path':path,'sni':host},safe='/')
+        return f'vless://{r["uuid"]}@{host}:{port}?{qp}#{name}'
     path=s.get('ws_path','/ws') or '/ws'
     qp=urllib.parse.urlencode({'encryption':'none','security':'tls','type':'ws','host':host,'path':path,'sni':host},safe='/')
     return f'vless://{r["uuid"]}@{host}:{port}?{qp}#{name}'
@@ -281,7 +330,7 @@ def client_data(h,r,s):
     now=int(time.time()); tr=traffic_for(r['id']); used=tr['upload']+tr['download']; total=int(float(r['gb'])*1024**3); remain=max(0,total-used)
     sub_host=host_for(h,s); proto=(r['protocol'] or 'vless').lower(); sub=(f'https://{sub_host}/dns-sub/{r["sub_id"]}' if proto=='dns' else f'https://{sub_host}/{s.get("sub_path","sub").strip("/")}/{r["sub_id"]}')
     online=(tr['last_seen'] and now-tr['last_seen']<=90)
-    return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
+    return {'id':r['id'],'name':r['name'],'protocol':r['protocol'] or 'vless','transport':r['transport'] if 'transport' in r.keys() else 'ws','uuid':r['uuid'],'subId':r['sub_id'],'gb':r['gb'],'days':r['days'],'createdAt':r['created_at'],'expiryAt':r['expiry_at'],'enabled':bool(r['enabled']),
             'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'totalBytes':total,'lastSeen':tr['last_seen'],'online':bool(online),
             'remainingText':fmt_bytes(remain),'usedText':fmt_bytes(used),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),
             'expiryText':fmt_date(r['expiry_at']),'vless':link_for(h,r,s),'config':link_for(h,r,s),'subscription':sub,'dnsServer':f'https://{sub_host}/doh/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','dnsProfile':dns_profile_for('internal'),'dnsSubscription':f'https://{sub_host}/dns-sub/{r["sub_id"]}','dnsUrl':f'https://{sub_host}/doh/{r["dns_token"]}' if (r['protocol'] or '')=='dns' and r['dns_token'] else '','wireguardConfig':wg_config_for(h,r,s),'version':PANEL_VERSION}
@@ -298,6 +347,10 @@ def sub_page(h,sid):
     if not rows:
         h.send_response(404); h.send_header('Content-Type','text/html; charset=utf-8'); h.end_headers(); h.wfile.write('<h2>اشتراک پیدا نشد یا منقضی شده است.</h2>'.encode()); return
     r=rows[0]; d=client_data(h,r,s); proto=(r['protocol'] or 'vless').upper(); title=html.escape(s.get('panel_title','vpnstan')); name=html.escape(r['name']); link=html.escape(d['vless'],quote=True); sub=html.escape(d['subscription'],quote=True)
+    if len(rows)>1:
+        trs=[traffic_for(x['id']) for x in rows]; total=sum(int(float(x['gb'])*1024**3) for x in rows)
+        up=sum(x['upload'] for x in trs); down=sum(x['download'] for x in trs); used=up+down; remain=max(0,total-used); last=max((x['last_seen'] for x in trs),default=0); exp=max((x['expiry_at'] for x in rows),default=0)
+        d.update({'upload':up,'download':down,'used':used,'remaining':remain,'totalBytes':total,'lastSeen':last,'online':bool(last and int(time.time())-last<=90),'usedText':fmt_bytes(used),'remainingText':fmt_bytes(remain),'totalText':fmt_bytes(total),'uploadText':fmt_bytes(up),'downloadText':fmt_bytes(down),'expiryText':fmt_date(exp)})
     pct=min(100,(d['used']/d['totalBytes']*100) if d['totalBytes'] else 0); status='آنلاین' if d['online'] else 'آفلاین'
     support=html.escape(s.get('support_url',''),quote=True); announce=html.escape(s.get('announce',''))
     qr=f'/qr/{r["sub_id"]}'
@@ -333,7 +386,7 @@ class H(BaseHTTPRequestHandler):
                 collect_xray_stats()
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid)
             if not rows:self.send_response(404); self.end_headers(); return
-            r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); exp=r['expiry_at']; self.send_response(200); self.send_header('Subscription-Userinfo',f'upload={tr["upload"]}; download={tr["download"]}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Cache-Control','no-store, no-cache, must-revalidate'); self.end_headers(); return
+            total=sum(int(float(r['gb'])*1024**3) for r in rows); up=sum(traffic_for(r['id'])['upload'] for r in rows); down=sum(traffic_for(r['id'])['download'] for r in rows); exp=max((r['expiry_at'] for r in rows),default=0); self.send_response(200); self.send_header('Subscription-Userinfo',f'upload={up}; download={down}; total={total}; expire={exp}'); self.send_header('Profile-Title',base64.b64encode(s.get('panel_title','vpnstan').encode()).decode()); self.send_header('Profile-Update-Interval','1'); self.send_header('Cache-Control','no-store, no-cache, must-revalidate'); self.end_headers(); return
         self.send_response(404); self.end_headers()
     def do_OPTIONS(self):
         p=urllib.parse.urlparse(self.path).path
@@ -400,14 +453,16 @@ class H(BaseHTTPRequestHandler):
                 collect_xray_stats()
             s,rows=load_sub(self,sid)
             if not rows:return send(self,404,{'error':'subscription not found'})
-            r=rows[0]; tr=traffic_for(r['id']); total=int(float(r['gb'])*1024**3); used=tr['upload']+tr['download']; remain=max(0,total-used)
-            return send(self,200,{'upload':tr['upload'],'download':tr['download'],'used':used,'remaining':remain,'total':total,'usedText':fmt_bytes(used),'remainingText':fmt_bytes(remain),'uploadText':fmt_bytes(tr['upload']),'downloadText':fmt_bytes(tr['download']),'percent':round((used/total*100) if total else 0,2),'online':bool(tr['last_seen'] and int(time.time())-tr['last_seen']<=20),'lastSeen':tr['last_seen']})
+            total=sum(int(float(r['gb'])*1024**3) for r in rows)
+            trs=[traffic_for(r['id']) for r in rows]; up=sum(x['upload'] for x in trs); down=sum(x['download'] for x in trs)
+            used=up+down; remain=max(0,total-used); last=max((x['last_seen'] for x in trs),default=0)
+            return send(self,200,{'upload':up,'download':down,'used':used,'remaining':remain,'total':total,'usedText':fmt_bytes(used),'remainingText':fmt_bytes(remain),'uploadText':fmt_bytes(up),'downloadText':fmt_bytes(down),'percent':round((used/total*100) if total else 0,2),'online':bool(last and int(time.time())-last<=90),'lastSeen':last})
         if p.startswith('/subjson/'):
             sid=p.split('/')[-1]; s,rows=load_sub(self,sid); out=[]; host=host_for(self,s); port=int(s.get('node_port','443'))
             for r in rows:
                 proto=(r['protocol'] or 'vless')
                 if proto=='vless':
-                    out.append({'protocol':'vless','tag':r['name'],'settings':{'vnext':[{'address':host,'port':port,'users':[{'id':r['uuid'],'encryption':'none'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host},'wsSettings':{'path':s.get('ws_path','/ws')}}})
+                    out.append({'protocol':'vless','tag':r['name'],'settings':{'vnext':[{'address':host,'port':port,'users':[{'id':r['uuid'],'encryption':'none'}]}]},'streamSettings':({'network':'xhttp','security':'tls','tlsSettings':{'serverName':host},'xhttpSettings':{'path':s.get('xhttp_path','/xhttp'),'mode':'auto'}} if (r['transport'] or 'ws')=='xhttp' else {'network':'ws','security':'tls','tlsSettings':{'serverName':host},'wsSettings':{'path':s.get('ws_path','/ws')}})})
                 elif proto=='vmess':
                     out.append({'protocol':'vmess','tag':r['name'],'settings':{'vnext':[{'address':host,'port':port,'users':[{'id':r['uuid'],'alterId':0,'security':'auto'}]}]},'streamSettings':{'network':'ws','security':'tls','tlsSettings':{'serverName':host},'wsSettings':{'path':s.get('vmess_path','/vmess')}}})
             return send(self,200,out)
@@ -506,7 +561,7 @@ class H(BaseHTTPRequestHandler):
             if current_user(self)['id']==uid:return send(self,400,{'success':False,'msg':'اکانت فعلی را نمی‌توان حذف کرد'})
             c=db(); c.execute('DELETE FROM panel_users WHERE id=?',(uid,)); c.commit(); c.close(); return send(self,200,{'success':True})
         if p=='/api/settings':
-            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server','dns_profile','theme'}
+            try:d=body(self); allowed={'node_host','node_port','ws_path','vmess_path','xhttp_path','sub_path','panel_title','support_url','announce','update_interval','wg_endpoint','wg_server_public_key','dns_server','dns_profile','theme'}
             except:return send(self,400,{'success':False,'msg':'درخواست نامعتبر'})
             if 'node_port' in d:
                 try: port=int(d['node_port']); assert 1<=port<=65535
@@ -516,8 +571,8 @@ class H(BaseHTTPRequestHandler):
             restart_xray(); return send(self,200,{'success':True,'settings':settings()})
         if p=='/api/clients/create':
             try:
-                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); sub_count=int(d.get('subCount',1) or 1); st=settings(); dns_server=('internal' if protocol=='dns' else st.get('dns_server',''))
-                if protocol not in ('vless','vmess','wireguard','dns') or not name or gb<=0 or days<=0 or len(name)>80 or sub_count<1 or sub_count>20: raise ValueError
+                d=body(self); name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower(); transport=str(d.get('transport','ws')).lower(); transport=str(d.get('transport','ws')).lower(); sub_count=int(d.get('subCount',1) or 1); st=settings(); dns_server=('internal' if protocol=='dns' else st.get('dns_server',''))
+                if protocol not in ('vless','vmess','wireguard','dns') or transport not in ('ws','xhttp') or (protocol!='vless' and transport!='ws') or not name or gb<=0 or days<=0 or len(name)>80 or sub_count<1 or sub_count>20: raise ValueError
                 if protocol=='dns' and sub_count!=1: raise ValueError
             except:return send(self,400,{'success':False,'msg':'نام، حجم، مدت یا تعداد کانفیگ نامعتبر است'})
             now=int(time.time()); sub_id=secrets.token_urlsafe(18); rows=[]
@@ -525,8 +580,8 @@ class H(BaseHTTPRequestHandler):
             for i in range(sub_count):
                 cname=name if sub_count==1 else f'{name}-{i+1:02d}'
                 cuuid=str(uuid.uuid4()); dns_token=secrets.token_urlsafe(24) if protocol=='dns' else ''
-                r=(cname,cuuid,sub_id,gb,days,now,now+days*86400,protocol,dns_server,'','10.66.0.2/32',dns_token)
-                c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,dns_server,wg_private_key,wg_address,dns_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',r)
+                r=(cname,cuuid,sub_id,gb,days,now,now+days*86400,protocol,transport,dns_server,'','10.66.0.2/32',dns_token)
+                c.execute('INSERT INTO clients(name,uuid,sub_id,gb,days,created_at,expiry_at,protocol,transport,dns_server,wg_private_key,wg_address,dns_token) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',r)
                 rows.append(c.execute('SELECT * FROM clients WHERE uuid=?',(cuuid,)).fetchone())
             c.commit(); c.close(); restart_xray(); first=rows[0]
             return send(self,201,{'success':True,'count':sub_count,'subId':sub_id,'client':client_data(self,first,settings()),'clients':[client_data(self,r,settings()) for r in rows]})
@@ -534,7 +589,7 @@ class H(BaseHTTPRequestHandler):
             try:
                 cid=int(p.split('/')[3]); d=body(self)
                 name=str(d.get('name','')).strip(); gb=float(d.get('gb',0)); days=int(d.get('days',0)); protocol=str(d.get('protocol','vless')).lower()
-                if not name or gb<=0 or days<=0 or len(name)>80 or protocol not in ('vless','vmess','wireguard','dns'): raise ValueError
+                if not name or gb<=0 or days<=0 or len(name)>80 or protocol not in ('vless','vmess','wireguard','dns') or transport not in ('ws','xhttp') or (protocol!='vless' and transport!='ws'): raise ValueError
             except Exception:
                 return send(self,400,{'success':False,'msg':'نام، حجم، مدت یا پروتکل نامعتبر است'})
             c=db(); old=c.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone()
@@ -543,7 +598,7 @@ class H(BaseHTTPRequestHandler):
             dns_token=old['dns_token'] or (secrets.token_urlsafe(24) if protocol=='dns' else '')
             if protocol!='dns': dns_token=''
             dns_server='internal' if protocol=='dns' else ''
-            c.execute('UPDATE clients SET name=?,gb=?,days=?,expiry_at=?,protocol=?,dns_server=?,dns_token=?,enabled=1 WHERE id=?',(name,gb,days,expiry,protocol,dns_server,dns_token,cid)); c.commit(); row=c.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone(); c.close(); restart_xray(); return send(self,200,{'success':True,'client':client_data(self,row,settings())})
+            c.execute('UPDATE clients SET name=?,gb=?,days=?,expiry_at=?,protocol=?,transport=?,dns_server=?,dns_token=?,enabled=1 WHERE id=?',(name,gb,days,expiry,protocol,transport,dns_server,dns_token,cid)); c.commit(); row=c.execute('SELECT * FROM clients WHERE id=?',(cid,)).fetchone(); c.close(); restart_xray(); return send(self,200,{'success':True,'client':client_data(self,row,settings())})
         if p.startswith('/api/clients/') and p.endswith('/toggle'):
             try:cid=int(p.split('/')[3])
             except:return send(self,400,{'success':False,'msg':'شناسه نامعتبر'})
